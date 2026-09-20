@@ -40,6 +40,13 @@ func (d *DecisionRecorder) ObserveDecision(o ratelimiter.Observation) {
 	if o.Allowed {
 		return
 	}
+
+	// A blocked request is refused by the tier, not by the bucket: that is the
+	// tier_denials_total series.
+	if o.Reason == ratelimiter.ReasonBlocked {
+		d.metrics.TierDenials.WithLabelValues(o.Tier.String()).Inc()
+	}
+
 	switch o.Reason {
 	case ratelimiter.ReasonStorageError, ratelimiter.ReasonCapacity:
 		d.metrics.RateLimitStorageFailures.WithLabelValues(string(o.Reason)).Inc()

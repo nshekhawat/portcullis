@@ -129,6 +129,45 @@ func newTestMetrics() *Metrics {
 			},
 			[]string{"method"},
 		),
+
+		JudgeRequests: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Namespace: "test", Name: "judge_requests_total"},
+			[]string{"judge", "outcome"},
+		),
+		JudgeLatency: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{Namespace: "test", Name: "judge_latency_seconds"},
+			[]string{"judge"},
+		),
+		JudgeSuspects:    prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "test", Name: "judge_suspects_per_call"}),
+		JudgeInputTokens: prometheus.NewCounter(prometheus.CounterOpts{Namespace: "test", Name: "judge_input_tokens_total"}),
+		Verdicts: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Namespace: "test", Name: "verdicts_total"},
+			[]string{"label", "confidence_band"},
+		),
+		TierTransitions: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Namespace: "test", Name: "tier_transitions_total"},
+			[]string{"from", "to", "source"},
+		),
+		ActiveTiers: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{Namespace: "test", Name: "active_tiers"},
+			[]string{"tier"},
+		),
+		TierDenials: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Namespace: "test", Name: "tier_denials_total"},
+			[]string{"tier"},
+		),
+		GuardrailTrips: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Namespace: "test", Name: "guardrail_trips_total"},
+			[]string{"guardrail"},
+		),
+		BreakerState: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{Namespace: "test", Name: "breaker_state"},
+			[]string{"judge"},
+		),
+		SignalsDropped:    prometheus.NewCounter(prometheus.CounterOpts{Namespace: "test", Name: "signals_dropped_total"}),
+		TrackedIdentities: prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "test", Name: "tracked_identities"}),
+		DetectionCycle:    prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "test", Name: "detection_cycle_seconds"}),
+		SuspectsSelected:  prometheus.NewCounter(prometheus.CounterOpts{Namespace: "test", Name: "suspects_selected_total"}),
 	}
 }
 

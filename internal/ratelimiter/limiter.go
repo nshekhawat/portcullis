@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/nshekhawat/portcullis/internal/bucket"
+	"github.com/nshekhawat/portcullis/internal/policy"
 	"github.com/nshekhawat/portcullis/internal/storage"
 )
 
@@ -90,6 +91,8 @@ type Decision struct {
 	RetryAfter time.Duration
 	ResetAt    time.Time
 	Reason     Reason
+	// Tier is the enforcement tier that applied, if any.
+	Tier policy.Tier
 }
 
 // LimitInfo provides information about the current rate limit status.
@@ -119,6 +122,7 @@ type Observation struct {
 	Resource       string
 	Tokens         int64
 	Reason         Reason
+	Tier           policy.Tier
 }
 
 // Config holds the rate limiter configuration.
@@ -131,6 +135,13 @@ type Config struct {
 	// OnStorageError decides the outcome when the storage layer fails:
 	// "deny" (fail closed, default) or "allow".
 	OnStorageError string
+
+	// Tiers, when set, is consulted on every check. A block-tier identity is
+	// refused without touching storage; other tiers scale the rule.
+	Tiers policy.TierStore
+
+	// TierConfigs gives the multiplier, TTL and status of each tier.
+	TierConfigs map[policy.Tier]policy.TierConfig
 
 	// Observer, when set, receives every decision. Optional.
 	Observer DecisionObserver
@@ -218,42 +229,74 @@ func (rl *RateLimiter) AllowWithRule(ctx context.Context, identifier, resource s
 		return nil, fmt.Errorf("%w (got %d, capacity %d)", ErrInvalidTokens, tokens, rule.Capacity)
 	}
 
+	now := time.Now()
 	key := rl.keyExtractor(ctx, identifier, resource)
 
-	decision, err := rl.consume(ctx, key, tokens, rule)
+	// Tier lookup runs before storage: a blocked identity is refused without
+	// touching the bucket store at all (spec §5.5).
+	capacity := rule.Capacity
+	ratePerSec := rule.RatePerSecond()
+	tier := policy.TierNormal
+
+	if rl.config.Tiers != nil {
+		if entry, ok := rl.config.Tiers.Lookup(identifier, now); ok {
+			tier = entry.Tier
+			if entry.Tier == policy.TierBlock {
+				decision := &Decision{
+					Allowed:   false,
+					Limit:     capacity,
+					Remaining: 0,
+					ResetAt:   entry.Until,
+					Reason:    ReasonBlocked,
+					Tier:      tier,
+				}
+				if !entry.Until.IsZero() && entry.Until.After(now) {
+					decision.RetryAfter = entry.Until.Sub(now)
+				}
+				rl.observe(identifier, resource, tokens, decision)
+				return decision, nil
+			}
+			if cfg, ok := rl.config.TierConfigs[entry.Tier]; ok {
+				capacity, ratePerSec = cfg.Effective(rule.Capacity, ratePerSec)
+			}
+		}
+	}
+
+	decision, err := rl.consume(ctx, key, tokens, capacity, ratePerSec, rule.Name)
 	if err != nil {
 		return nil, err
 	}
+	decision.Tier = tier
 
 	rl.observe(identifier, resource, tokens, decision)
 	return decision, nil
 }
 
 // consume performs the storage call and converts the result into a Decision.
-func (rl *RateLimiter) consume(ctx context.Context, key string, tokens int64, rule *Rule) (*Decision, error) {
+func (rl *RateLimiter) consume(ctx context.Context, key string, tokens, capacity int64, ratePerSec float64, ruleName string) (*Decision, error) {
 	now := time.Now()
-	result, err := rl.storage.CheckAndConsume(ctx, key, tokens, rule.Capacity, rule.RatePerSecond(), rl.config.TTL)
+	result, err := rl.storage.CheckAndConsume(ctx, key, tokens, capacity, ratePerSec, rl.config.TTL)
 	if err != nil {
 		// A full bucket table is a capacity problem, not a limiter failure: the
 		// safe answer is to deny and say so (B5).
 		if errors.Is(err, storage.ErrCapacity) {
-			rl.logger.Warn("rate limit storage at capacity, denying", zap.String("rule", rule.Name))
-			return rl.denied(rule, ReasonCapacity, now), nil
+			rl.logger.Warn("rate limit storage at capacity, denying", zap.String("rule", ruleName))
+			return denied(capacity, ReasonCapacity, now), nil
 		}
 
 		if rl.config.OnStorageError == "allow" {
 			rl.logger.Error("rate limit storage error, allowing by policy", zap.Error(err))
 			return &Decision{
 				Allowed:   true,
-				Limit:     rule.Capacity,
-				Remaining: rule.Capacity,
+				Limit:     capacity,
+				Remaining: capacity,
 				ResetAt:   now,
 				Reason:    ReasonStorageError,
 			}, nil
 		}
 
 		rl.logger.Error("rate limit storage error, denying by policy", zap.Error(err))
-		return rl.denied(rule, ReasonStorageError, now), nil
+		return denied(capacity, ReasonStorageError, now), nil
 	}
 
 	decision := &Decision{
@@ -265,17 +308,17 @@ func (rl *RateLimiter) consume(ctx context.Context, key string, tokens int64, ru
 
 	if !result.Allowed {
 		decision.Reason = ReasonLimit
-		decision.RetryAfter = retryAfter(tokens, result.CurrentTokens, result.RefillRate)
+		decision.RetryAfter = retryAfter(tokens, result.CurrentTokens, result.RefillRate, capacity)
 	}
 
 	return decision, nil
 }
 
 // denied builds a fail-closed decision with no storage interaction.
-func (rl *RateLimiter) denied(rule *Rule, reason Reason, now time.Time) *Decision {
+func denied(capacity int64, reason Reason, now time.Time) *Decision {
 	return &Decision{
 		Allowed:   false,
-		Limit:     rule.Capacity,
+		Limit:     capacity,
 		Remaining: 0,
 		ResetAt:   now,
 		Reason:    reason,
@@ -284,8 +327,8 @@ func (rl *RateLimiter) denied(rule *Rule, reason Reason, now time.Time) *Decisio
 
 // retryAfter returns how long until tokens become available. It is zero when
 // they never will, so a caller is never told to retry against a wall (B9).
-func retryAfter(requested int64, available, ratePerSec float64) time.Duration {
-	if ratePerSec <= 0 {
+func retryAfter(requested int64, available, ratePerSec float64, capacity int64) time.Duration {
+	if ratePerSec <= 0 || requested > capacity {
 		return 0
 	}
 	needed := float64(requested) - available
@@ -336,19 +379,29 @@ func (rl *RateLimiter) GetLimitInfo(ctx context.Context, identifier, resource st
 
 	rule := rl.getRule(resource)
 	key := rl.keyExtractor(ctx, identifier, resource)
+	now := time.Now()
+
+	capacity := rule.Capacity
+	ratePerSec := rule.RatePerSecond()
+	if rl.config.Tiers != nil {
+		if entry, ok := rl.config.Tiers.Lookup(identifier, now); ok {
+			if cfg, ok := rl.config.TierConfigs[entry.Tier]; ok {
+				capacity, ratePerSec = cfg.Effective(rule.Capacity, ratePerSec)
+			}
+		}
+	}
 
 	state, err := rl.storage.Get(ctx, key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get limit info: %w", err)
 	}
 
-	now := time.Now()
 	if state == nil {
 		return &LimitInfo{
-			Limit:           rule.Capacity,
-			Remaining:       rule.Capacity,
+			Limit:           capacity,
+			Remaining:       capacity,
 			ResetAt:         now,
-			TokensAvailable: float64(rule.Capacity),
+			TokensAvailable: float64(capacity),
 		}, nil
 	}
 
@@ -356,14 +409,14 @@ func (rl *RateLimiter) GetLimitInfo(ctx context.Context, identifier, resource st
 	// immediately rather than after the next consume (B11).
 	refilled := bucket.Refill(
 		bucket.State{Tokens: state.Tokens, LastRefill: state.LastRefillTime},
-		rule.Capacity, rule.RatePerSecond(), now,
+		capacity, ratePerSec, now,
 	)
 	tokens := refilled.Tokens
 
 	return &LimitInfo{
-		Limit:           rule.Capacity,
+		Limit:           capacity,
 		Remaining:       int64(tokens),
-		ResetAt:         resetTime(tokens, rule.Capacity, rule.RatePerSecond(), now),
+		ResetAt:         resetTime(tokens, capacity, ratePerSec, now),
 		TokensAvailable: tokens,
 	}, nil
 }
