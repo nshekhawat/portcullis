@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"net/netip"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
 	"github.com/nshekhawat/portcullis/internal/netx"
 	"github.com/nshekhawat/portcullis/internal/ratelimiter"
+	"github.com/nshekhawat/portcullis/internal/signals"
 )
 
 // unmatchedRoute is the resource used when no route matched the request. Using
@@ -57,6 +59,14 @@ type RateLimitConfig struct {
 	// BypassSecrets are the accepted secrets. Without at least one, the bypass
 	// header is ignored entirely.
 	BypassSecrets []string
+
+	// Signals, when set, receives one observation per request after the handler
+	// has run, so the status code is known. Recording never blocks.
+	Signals signals.Recorder
+	// RouteOf, when set, overrides the route recorded in the observation. The
+	// rate-limit resource stays a bounded configured name; the observation route
+	// is what detection uses for diversity, so a proxy can report the path here.
+	RouteOf func(*gin.Context) string
 }
 
 // ClientIP resolves the originating client address for a request.
@@ -147,6 +157,11 @@ func RateLimitMiddleware(limiter *ratelimiter.RateLimiter, config *RateLimitConf
 		}
 	}
 
+	var record recorder
+	if config.Signals != nil {
+		record = newRecorder(config.Signals, config.RouteOf)
+	}
+
 	return func(c *gin.Context) {
 		if config.SkipFunc != nil && config.SkipFunc(c) {
 			c.Next()
@@ -173,10 +188,49 @@ func RateLimitMiddleware(limiter *ratelimiter.RateLimiter, config *RateLimitConf
 
 		if !decision.Allowed {
 			rateLimitedHandler(c, decision)
+			// Denied requests are the interesting ones: record them too, with
+			// the denial status already written.
+			if record != nil {
+				record(c, key, resource, decision.Allowed)
+			}
 			return
 		}
 
 		c.Next()
+		if record != nil {
+			record(c, key, resource, decision.Allowed)
+		}
+	}
+}
+
+// recorder observes one finished request.
+type recorder func(c *gin.Context, identity, route string, allowed bool)
+
+// newRecorder adapts a signals recorder to the middleware's per-request state.
+//
+// It runs after the handler so the status code is known. The recorder itself
+// must not block, which is what keeps this off the latency path.
+func newRecorder(rec signals.Recorder, routeOf func(*gin.Context) string) recorder {
+	return func(c *gin.Context, identity, route string, allowed bool) {
+		if routeOf != nil {
+			route = routeOf(c)
+		}
+
+		status := 0
+		if c.Writer != nil {
+			status = c.Writer.Status()
+		}
+
+		rec.Record(signals.Observation{
+			Identity: identity,
+			Route:    route,
+			Path:     c.Request.URL.Path,
+			Method:   c.Request.Method,
+			Status:   status,
+			UAFamily: signals.ClassifyUA(c.GetHeader("User-Agent")),
+			Allowed:  allowed,
+			At:       time.Now(),
+		})
 	}
 }
 

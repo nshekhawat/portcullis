@@ -1,0 +1,111 @@
+# Gateway replica configuration for the demo stack.
+#
+# The demo trusts the compose network so the traffic generator's synthetic
+# client addresses are honoured. In production, trust only your ingress
+# controllers here.
+server:
+  http_port: 8080
+  grpc_port: 9090
+  read_header_timeout: 5s
+  idle_timeout: 60s
+  max_header_bytes: 65536
+  max_body_bytes: 65536
+  trusted_proxies: ["172.28.0.0/16"]
+
+admin:
+  tokens_env: PORTCULLIS_ADMIN_TOKENS
+
+storage:
+  backend: redis
+  on_storage_error: deny
+
+redis:
+  address: "redis:6379"
+
+memory:
+  cleanup_interval: 1m
+  max_keys: 1000000
+
+ratelimit:
+  key_prefix: "pc:"
+  ttl: 1h
+  default_rule: { name: default, capacity: 100, refill_rate: 100, period: 1m }
+  rules:
+    login: { capacity: 30, refill_rate: 30, period: 1m }
+
+gateway:
+  listen: ":8000"
+  admin_listen: ":8081"
+  upstream: "http://upstream:3000"
+  routes:
+    - { prefix: /login, rule: login }
+  identifier_header: X-Portcullis-Identity
+  api_key_header: X-Portcullis-Key
+  max_body_bytes: 65536
+
+signals:
+  enabled: true
+  buffer: 65536
+  window: 30s
+  max_identities: 50000
+  sampled_paths_per_identity: 8
+  aggregate_prefixes: true
+
+detection:
+  interval: 2s
+  max_suspects: 25
+  min_score: 3.0
+  min_requests: 20
+  hard_evidence:
+    rps_ceiling: 50
+    auth_fail_ratio: 0.8
+
+judgment:
+  # The demo starts in shadow so the walkthrough can show decisions before
+  # enforcement, then flips to enforce with:
+  #   curl -X PUT -H "Authorization: Bearer $PORTCULLIS_ADMIN_TOKENS" \
+  #        -d '{"mode":"enforce"}' http://localhost:8081/v1/admin/config/mode
+  mode: shadow
+  # The stack runs the real TypeSafe client against the fake server, so the
+  # wire format is exercised without an API key.
+  judge: typesafe
+  fallback_judge: rules
+  timeout: 2s
+  budget:
+    max_calls_per_minute: 600
+    max_input_tokens_per_day: 0
+  circuit_breaker: { failures: 3, open_for: 30s }
+  typesafe:
+    # Points at the fake TypeSafe server in the demo stack. Swap this for
+    # https://api.typesafe.ai and set TYPESAFE_API_KEY for a real model.
+    base_url: "http://mockjev:8099"
+    api_key_env: TYPESAFE_API_KEY
+    model: jev-1.13.0
+    send_sampled_paths: true
+  min_confidence_to_act: 0.6
+  tiers:
+    watch:    { multiplier: 1.0,  ttl: 2m }
+    throttle: { multiplier: 0.25, ttl: 3m }
+    strict:   { multiplier: 0.05, ttl: 5m }
+    block:    { multiplier: 0.0,  ttl: 10m, status: 429 }
+  guardrails:
+    allowlist: ["127.0.0.1/32", "172.28.0.1/32"]
+    # The demo population is small, so the shipped 0.9 floor would leave the
+    # offline rules judge (l7_flood 0.85) at strict. Lowered here to show blocks.
+    block_min_confidence: 0.8
+    block_requires_hard_evidence: true
+    max_new_blocks_per_cycle: 5
+    max_non_normal_fraction: 1.0
+    max_ttl: 30m
+  audit:
+    ring_size: 2000
+    log: true
+
+metrics:
+  enabled: true
+  path: /metrics
+
+logging:
+  level: info
+  format: json
+  output: stdout

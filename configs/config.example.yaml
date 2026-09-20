@@ -83,3 +83,72 @@ logging:
   level: info    # debug, info, warn, error
   format: json   # json, console, text
   output: stdout
+
+gateway:
+  listen: ":8000"
+  admin_listen: ":8081"          # health and admin endpoints; never proxied
+  upstream: ""                   # e.g. http://app:3000, or pass --upstream
+  routes:                        # path prefixes mapped onto rules below
+    - { prefix: /login, rule: login }
+  identifier_header: X-Portcullis-Identity
+  api_key_header: X-Portcullis-Key
+  max_body_bytes: 1048576
+  shutdown_timeout: 30s
+
+signals:
+  enabled: true
+  buffer: 65536                  # channel size; overflow drops (counted)
+  window: 60s                    # 10 sub-buckets of 6s
+  max_identities: 200000         # LRU-evict the least active beyond this
+  sampled_paths_per_identity: 8
+  aggregate_prefixes: true       # also track IPv4 /24 and IPv6 /48
+
+detection:
+  interval: 10s
+  max_suspects: 25               # per cycle, and per judge call
+  min_score: 3.0
+  min_requests: 20               # ignore identities with too little data
+  hard_evidence:
+    rps_ceiling: 50              # sustained rps over the window
+    auth_fail_ratio: 0.8         # with at least 10 auth attempts
+    scanner_paths_file: ""       # optional override of the built-in list
+
+judgment:
+  mode: shadow                   # off | shadow | enforce
+  judge: rules                   # rules | typesafe | mock
+  fallback_judge: rules          # used while the primary's breaker is open
+  timeout: 2s
+  budget:
+    max_calls_per_minute: 12     # well under TypeSafe's 1200 rpm
+    max_input_tokens_per_day: 20000000
+  circuit_breaker: { failures: 3, open_for: 30s }
+  typesafe:
+    base_url: https://api.typesafe.ai   # swap for a gateway or the fake server
+    api_key_env: TYPESAFE_API_KEY
+    model: jev-1.13.0            # pin a version; thresholds are tuned to it
+    send_sampled_paths: true     # set false in strict environments
+  policy:                        # label -> [{min_confidence, tier}, ...], highest first
+    legitimate_burst:      [ { min_confidence: 0.0,  tier: normal } ]
+    benign_crawler:        [ { min_confidence: 0.0,  tier: normal } ]
+    misbehaving_client:    [ { min_confidence: 0.75, tier: throttle }, { min_confidence: 0.0, tier: watch } ]
+    scraper:               [ { min_confidence: 0.8,  tier: throttle }, { min_confidence: 0.6, tier: watch } ]
+    credential_stuffing:   [ { min_confidence: 0.85, tier: strict },   { min_confidence: 0.6, tier: throttle } ]
+    vulnerability_scanner: [ { min_confidence: 0.85, tier: block },    { min_confidence: 0.6, tier: strict } ]
+    api_enumeration:       [ { min_confidence: 0.8,  tier: strict },   { min_confidence: 0.6, tier: throttle } ]
+    l7_flood:              [ { min_confidence: 0.8,  tier: block },    { min_confidence: 0.6, tier: strict } ]
+  min_confidence_to_act: 0.6     # below this, the most that happens is watch
+  tiers:
+    watch:    { multiplier: 1.0,  ttl: 10m }
+    throttle: { multiplier: 0.25, ttl: 15m }
+    strict:   { multiplier: 0.05, ttl: 30m }
+    block:    { multiplier: 0.0,  ttl: 60m, status: 429 }
+  guardrails:
+    allowlist: ["127.0.0.1/32"]  # CIDRs or exact identities; never escalated
+    block_min_confidence: 0.9
+    block_requires_hard_evidence: true
+    max_new_blocks_per_cycle: 5
+    max_non_normal_fraction: 0.02
+    max_ttl: 24h
+  audit:
+    ring_size: 2000
+    log: true

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"sort"
 	"syscall"
 	"time"
 
@@ -15,11 +14,9 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	"github.com/nshekhawat/portcullis/internal/config"
-	"github.com/nshekhawat/portcullis/internal/metrics"
 	"github.com/nshekhawat/portcullis/internal/netx"
 	"github.com/nshekhawat/portcullis/internal/ratelimiter"
 	"github.com/nshekhawat/portcullis/internal/server"
-	"github.com/nshekhawat/portcullis/internal/storage"
 )
 
 // runServe starts the HTTP and gRPC check APIs.
@@ -70,11 +67,13 @@ func runServe(args []string) error {
 		return fmt.Errorf("invalid server.trusted_proxies: %w", err)
 	}
 
-	limiterConfig := cfg.ToRateLimiterConfig()
-	limiterConfig.OnStorageError = cfg.Storage.OnStorageError
-	limiterConfig.Observer = metrics.NewDecisionRecorder(metrics.DefaultMetrics, ruleNames(cfg)...)
+	judgment, err := buildPlane(context.Background(), cfg, logger)
+	if err != nil {
+		return fmt.Errorf("failed to build the judgment plane: %w", err)
+	}
+	defer judgment.close()
 
-	limiter := ratelimiter.NewRateLimiter(store, limiterConfig, logger)
+	limiter := ratelimiter.NewRateLimiter(store, buildLimiterConfig(cfg, judgment), logger)
 
 	errCh := make(chan error, 2)
 
@@ -92,7 +91,13 @@ func runServe(args []string) error {
 		TrustedProxies:    trustedProxies,
 		AdminTokens:       cfg.Admin.Tokens(),
 		CORSOrigins:       cfg.Server.CORSOrigins,
-		Metrics:           metrics.DefaultMetrics,
+		Metrics:           metricsRegistry(),
+		Tiers:             judgment.tiers,
+		Audit:             judgment.audit,
+		Mode:              judgment.controller,
+		Signals:           judgment.recorder,
+		TierConfigs:       judgment.tierConfigs,
+		MaxTTL:            cfg.Judgment.Guardrails.MaxTTL,
 	}, logger)
 
 	go func() {
@@ -108,7 +113,13 @@ func runServe(args []string) error {
 		EnableReflection:  cfg.Server.GRPCReflection,
 		EnableHealthCheck: true,
 		AdminTokens:       cfg.Admin.Tokens(),
-		Metrics:           metrics.DefaultMetrics,
+		Metrics:           metricsRegistry(),
+		Tiers:             judgment.tiers,
+		Audit:             judgment.audit,
+		Mode:              judgment.controller,
+		Signals:           judgment.recorder,
+		TierConfigs:       judgment.tierConfigs,
+		MaxTTL:            cfg.Judgment.Guardrails.MaxTTL,
 	}, logger)
 
 	go func() {
@@ -142,20 +153,7 @@ func runServe(args []string) error {
 	return nil
 }
 
-// ruleNames returns the configured rule names for the metrics allowlist,
-// sorted for determinism.
-func ruleNames(cfg *config.Config) []string {
-	names := make([]string, 0, len(cfg.RateLimit.Rules)+1)
-	if name := cfg.RateLimit.DefaultRule.Name; name != "" {
-		names = append(names, name)
-	}
-	for name := range cfg.RateLimit.Rules {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
+// initLogger builds the process logger from configuration.
 func initLogger(cfg config.LoggingConfig) (*zap.Logger, error) {
 	var level zapcore.Level
 	if err := level.UnmarshalText([]byte(cfg.Level)); err != nil {
@@ -176,53 +174,4 @@ func initLogger(cfg config.LoggingConfig) (*zap.Logger, error) {
 	}
 
 	return zapConfig.Build()
-}
-
-// initStorage builds the configured backend. The backend is chosen by
-// storage.backend; the pre-rename PORTCULLIS_USE_REDIS variable still works
-// for one release (B17).
-func initStorage(cfg *config.Config, logger *zap.Logger) (storage.AtomicStorage, error) {
-	backend := cfg.Storage.Backend
-	if useRedisEnv() {
-		logger.Warn("PORTCULLIS_USE_REDIS is deprecated; set storage.backend: redis instead")
-		backend = config.BackendRedis
-	}
-
-	switch backend {
-	case config.BackendRedis:
-		logger.Info("initializing Redis storage", zap.String("address", cfg.Redis.Address))
-		store, err := storage.NewRedisStorage(&storage.RedisConfig{
-			Address:      cfg.Redis.Address,
-			Password:     cfg.Redis.Password,
-			DB:           cfg.Redis.DB,
-			PoolSize:     cfg.Redis.PoolSize,
-			MinIdleConns: cfg.Redis.MinIdleConns,
-			DialTimeout:  cfg.Redis.DialTimeout,
-			ReadTimeout:  cfg.Redis.ReadTimeout,
-			WriteTimeout: cfg.Redis.WriteTimeout,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to create Redis storage: %w", err)
-		}
-		return metrics.NewInstrumentedAtomicStorage(store, "redis", nil), nil
-
-	case config.BackendMemory:
-		logger.Info("initializing memory storage",
-			zap.Duration("cleanup_interval", cfg.Memory.CleanupInterval),
-			zap.Int("max_keys", cfg.Memory.MaxKeys),
-		)
-		store := storage.NewMemoryStorageWithOptions(storage.MemoryOptions{
-			CleanupInterval: cfg.Memory.CleanupInterval,
-			MaxKeys:         cfg.Memory.MaxKeys,
-		})
-		return metrics.NewInstrumentedAtomicStorage(store, "memory", nil), nil
-
-	default:
-		return nil, fmt.Errorf("unsupported storage backend %q", backend)
-	}
-}
-
-// useRedisEnv reports whether the legacy Redis toggle is set.
-func useRedisEnv() bool {
-	return os.Getenv(config.EnvPrefix+"USE_REDIS") == "true" || os.Getenv("RATE_LIMITER_USE_REDIS") == "true"
 }

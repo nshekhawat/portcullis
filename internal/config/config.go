@@ -47,6 +47,7 @@ type Config struct {
 	Metrics   MetricsConfig   `mapstructure:"metrics"`
 	Logging   LoggingConfig   `mapstructure:"logging"`
 
+	Gateway   GatewayConfig   `mapstructure:"gateway"`
 	Signals   SignalsConfig   `mapstructure:"signals"`
 	Detection DetectionConfig `mapstructure:"detection"`
 	Judgment  JudgmentConfig  `mapstructure:"judgment"`
@@ -239,6 +240,7 @@ func DefaultConfig() *Config {
 			Format: "json",
 			Output: "stdout",
 		},
+		Gateway:   DefaultGatewayConfig(),
 		Signals:   DefaultSignalsConfig(),
 		Detection: DefaultDetectionConfig(),
 		Judgment:  DefaultJudgmentConfig(),
@@ -384,6 +386,7 @@ func LoadFromViper(v *viper.Viper) (*Config, error) {
 // normalize fills in derived defaults that validation then checks, and records
 // retired settings that were still honored.
 func (c *Config) normalize() {
+	c.normalizeGateway()
 	c.normalizePlanes()
 	if c.RateLimit.DefaultRule.BurstSize != 0 {
 		c.Deprecations = append(c.Deprecations, "ratelimit.default_rule.burst_size")
@@ -458,6 +461,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("logging.level", def.Logging.Level)
 	v.SetDefault("logging.format", def.Logging.Format)
 	v.SetDefault("logging.output", def.Logging.Output)
+
+	// Gateway defaults
+	setGatewayDefaults(v)
 
 	// Signals, detection and judgment defaults
 	setPlaneDefaults(v)
@@ -557,6 +563,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid log format: %s", c.Logging.Format)
 	}
 
+	if err := c.validateGateway(); err != nil {
+		return err
+	}
 	return c.validatePlanes()
 }
 

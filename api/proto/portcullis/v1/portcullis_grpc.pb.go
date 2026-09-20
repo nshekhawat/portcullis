@@ -22,6 +22,7 @@ const (
 	RateLimiterService_CheckRateLimit_FullMethodName = "/portcullis.v1.RateLimiterService/CheckRateLimit"
 	RateLimiterService_GetLimitStatus_FullMethodName = "/portcullis.v1.RateLimiterService/GetLimitStatus"
 	RateLimiterService_ResetLimit_FullMethodName     = "/portcullis.v1.RateLimiterService/ResetLimit"
+	RateLimiterService_Report_FullMethodName         = "/portcullis.v1.RateLimiterService/Report"
 )
 
 // RateLimiterServiceClient is the client API for RateLimiterService service.
@@ -34,6 +35,9 @@ type RateLimiterServiceClient interface {
 	GetLimitStatus(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
 	// ResetLimit resets the rate limit for an identifier
 	ResetLimit(ctx context.Context, in *ResetRequest, opts ...grpc.CallOption) (*ResetResponse, error)
+	// Report records a request the caller already served, so the detection plane
+	// can see traffic that never passed through the gateway. Public.
+	Report(ctx context.Context, in *ReportRequest, opts ...grpc.CallOption) (*ReportResponse, error)
 }
 
 type rateLimiterServiceClient struct {
@@ -74,6 +78,16 @@ func (c *rateLimiterServiceClient) ResetLimit(ctx context.Context, in *ResetRequ
 	return out, nil
 }
 
+func (c *rateLimiterServiceClient) Report(ctx context.Context, in *ReportRequest, opts ...grpc.CallOption) (*ReportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportResponse)
+	err := c.cc.Invoke(ctx, RateLimiterService_Report_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RateLimiterServiceServer is the server API for RateLimiterService service.
 // All implementations must embed UnimplementedRateLimiterServiceServer
 // for forward compatibility.
@@ -84,6 +98,9 @@ type RateLimiterServiceServer interface {
 	GetLimitStatus(context.Context, *StatusRequest) (*StatusResponse, error)
 	// ResetLimit resets the rate limit for an identifier
 	ResetLimit(context.Context, *ResetRequest) (*ResetResponse, error)
+	// Report records a request the caller already served, so the detection plane
+	// can see traffic that never passed through the gateway. Public.
+	Report(context.Context, *ReportRequest) (*ReportResponse, error)
 	mustEmbedUnimplementedRateLimiterServiceServer()
 }
 
@@ -102,6 +119,9 @@ func (UnimplementedRateLimiterServiceServer) GetLimitStatus(context.Context, *St
 }
 func (UnimplementedRateLimiterServiceServer) ResetLimit(context.Context, *ResetRequest) (*ResetResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResetLimit not implemented")
+}
+func (UnimplementedRateLimiterServiceServer) Report(context.Context, *ReportRequest) (*ReportResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Report not implemented")
 }
 func (UnimplementedRateLimiterServiceServer) mustEmbedUnimplementedRateLimiterServiceServer() {}
 func (UnimplementedRateLimiterServiceServer) testEmbeddedByValue()                            {}
@@ -178,6 +198,24 @@ func _RateLimiterService_ResetLimit_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RateLimiterService_Report_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RateLimiterServiceServer).Report(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RateLimiterService_Report_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RateLimiterServiceServer).Report(ctx, req.(*ReportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RateLimiterService_ServiceDesc is the grpc.ServiceDesc for RateLimiterService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -196,6 +234,240 @@ var RateLimiterService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResetLimit",
 			Handler:    _RateLimiterService_ResetLimit_Handler,
+		},
+		{
+			MethodName: "Report",
+			Handler:    _RateLimiterService_Report_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "api/proto/portcullis/v1/portcullis.proto",
+}
+
+const (
+	AdminService_SetTier_FullMethodName       = "/portcullis.v1.AdminService/SetTier"
+	AdminService_ClearTier_FullMethodName     = "/portcullis.v1.AdminService/ClearTier"
+	AdminService_ListTiers_FullMethodName     = "/portcullis.v1.AdminService/ListTiers"
+	AdminService_ListDecisions_FullMethodName = "/portcullis.v1.AdminService/ListDecisions"
+)
+
+// AdminServiceClient is the client API for AdminService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// AdminService is the operator surface. Every RPC requires an admin bearer
+// token.
+type AdminServiceClient interface {
+	// SetTier writes a manual tier entry for an identity.
+	SetTier(ctx context.Context, in *SetTierRequest, opts ...grpc.CallOption) (*SetTierResponse, error)
+	// ClearTier removes an identity's tier entry. Idempotent.
+	ClearTier(ctx context.Context, in *ClearTierRequest, opts ...grpc.CallOption) (*ClearTierResponse, error)
+	// ListTiers returns every active tier entry.
+	ListTiers(ctx context.Context, in *ListTiersRequest, opts ...grpc.CallOption) (*ListTiersResponse, error)
+	// ListDecisions returns audit records, newest first.
+	ListDecisions(ctx context.Context, in *ListDecisionsRequest, opts ...grpc.CallOption) (*ListDecisionsResponse, error)
+}
+
+type adminServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewAdminServiceClient(cc grpc.ClientConnInterface) AdminServiceClient {
+	return &adminServiceClient{cc}
+}
+
+func (c *adminServiceClient) SetTier(ctx context.Context, in *SetTierRequest, opts ...grpc.CallOption) (*SetTierResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetTierResponse)
+	err := c.cc.Invoke(ctx, AdminService_SetTier_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminServiceClient) ClearTier(ctx context.Context, in *ClearTierRequest, opts ...grpc.CallOption) (*ClearTierResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ClearTierResponse)
+	err := c.cc.Invoke(ctx, AdminService_ClearTier_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminServiceClient) ListTiers(ctx context.Context, in *ListTiersRequest, opts ...grpc.CallOption) (*ListTiersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListTiersResponse)
+	err := c.cc.Invoke(ctx, AdminService_ListTiers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminServiceClient) ListDecisions(ctx context.Context, in *ListDecisionsRequest, opts ...grpc.CallOption) (*ListDecisionsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListDecisionsResponse)
+	err := c.cc.Invoke(ctx, AdminService_ListDecisions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// AdminServiceServer is the server API for AdminService service.
+// All implementations must embed UnimplementedAdminServiceServer
+// for forward compatibility.
+//
+// AdminService is the operator surface. Every RPC requires an admin bearer
+// token.
+type AdminServiceServer interface {
+	// SetTier writes a manual tier entry for an identity.
+	SetTier(context.Context, *SetTierRequest) (*SetTierResponse, error)
+	// ClearTier removes an identity's tier entry. Idempotent.
+	ClearTier(context.Context, *ClearTierRequest) (*ClearTierResponse, error)
+	// ListTiers returns every active tier entry.
+	ListTiers(context.Context, *ListTiersRequest) (*ListTiersResponse, error)
+	// ListDecisions returns audit records, newest first.
+	ListDecisions(context.Context, *ListDecisionsRequest) (*ListDecisionsResponse, error)
+	mustEmbedUnimplementedAdminServiceServer()
+}
+
+// UnimplementedAdminServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedAdminServiceServer struct{}
+
+func (UnimplementedAdminServiceServer) SetTier(context.Context, *SetTierRequest) (*SetTierResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetTier not implemented")
+}
+func (UnimplementedAdminServiceServer) ClearTier(context.Context, *ClearTierRequest) (*ClearTierResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ClearTier not implemented")
+}
+func (UnimplementedAdminServiceServer) ListTiers(context.Context, *ListTiersRequest) (*ListTiersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListTiers not implemented")
+}
+func (UnimplementedAdminServiceServer) ListDecisions(context.Context, *ListDecisionsRequest) (*ListDecisionsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListDecisions not implemented")
+}
+func (UnimplementedAdminServiceServer) mustEmbedUnimplementedAdminServiceServer() {}
+func (UnimplementedAdminServiceServer) testEmbeddedByValue()                      {}
+
+// UnsafeAdminServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to AdminServiceServer will
+// result in compilation errors.
+type UnsafeAdminServiceServer interface {
+	mustEmbedUnimplementedAdminServiceServer()
+}
+
+func RegisterAdminServiceServer(s grpc.ServiceRegistrar, srv AdminServiceServer) {
+	// If the following call panics, it indicates UnimplementedAdminServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&AdminService_ServiceDesc, srv)
+}
+
+func _AdminService_SetTier_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetTierRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServiceServer).SetTier(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AdminService_SetTier_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServiceServer).SetTier(ctx, req.(*SetTierRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AdminService_ClearTier_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClearTierRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServiceServer).ClearTier(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AdminService_ClearTier_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServiceServer).ClearTier(ctx, req.(*ClearTierRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AdminService_ListTiers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListTiersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServiceServer).ListTiers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AdminService_ListTiers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServiceServer).ListTiers(ctx, req.(*ListTiersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AdminService_ListDecisions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListDecisionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServiceServer).ListDecisions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AdminService_ListDecisions_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServiceServer).ListDecisions(ctx, req.(*ListDecisionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// AdminService_ServiceDesc is the grpc.ServiceDesc for AdminService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var AdminService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "portcullis.v1.AdminService",
+	HandlerType: (*AdminServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "SetTier",
+			Handler:    _AdminService_SetTier_Handler,
+		},
+		{
+			MethodName: "ClearTier",
+			Handler:    _AdminService_ClearTier_Handler,
+		},
+		{
+			MethodName: "ListTiers",
+			Handler:    _AdminService_ListTiers_Handler,
+		},
+		{
+			MethodName: "ListDecisions",
+			Handler:    _AdminService_ListDecisions_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

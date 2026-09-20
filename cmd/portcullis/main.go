@@ -20,6 +20,8 @@ Usage:
 
 Commands:
   serve        Run the check API (HTTP + gRPC) service
+  gateway      Run the reverse-proxy gateway
+  admin        Query and change runtime state through the admin API
   healthcheck  Probe the local /health endpoint (exit 0 on healthy)
   version      Print version information
   help         Print this message
@@ -37,6 +39,10 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		err = runServe(os.Args[2:])
+	case "gateway":
+		err = runGateway(os.Args[2:])
+	case "admin":
+		err = runAdmin(os.Args[2:])
 	case "healthcheck":
 		err = runHealthcheck(os.Args[2:])
 	case "version":

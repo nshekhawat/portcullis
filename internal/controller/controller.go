@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -54,6 +55,9 @@ type Options struct {
 type Controller struct {
 	opts Options
 
+	modeMu sync.RWMutex
+	mode   Mode
+
 	// newBlocksThisCycle is reset at the start of each cycle and meters how
 	// many identities may newly enter the block tier.
 	newBlocksThisCycle int
@@ -80,12 +84,41 @@ func New(opts Options) *Controller {
 	if opts.Interval <= 0 {
 		opts.Interval = 10 * time.Second
 	}
-	return &Controller{opts: opts}
+	return &Controller{opts: opts, mode: opts.Mode}
+}
+
+// Mode returns the judgment mode in force.
+func (c *Controller) Mode() Mode {
+	c.modeMu.RLock()
+	defer c.modeMu.RUnlock()
+	return c.mode
+}
+
+// SetMode changes the judgment mode at runtime.
+//
+// Operators use this to move from shadow to enforce after comparing decision
+// records against ground truth. Existing tiers are unaffected: they expire on
+// their own TTL.
+func (c *Controller) SetMode(mode Mode) error {
+	switch mode {
+	case ModeOff, ModeShadow, ModeEnforce:
+	default:
+		return fmt.Errorf("unknown judgment mode %q", mode)
+	}
+
+	c.modeMu.Lock()
+	defer c.modeMu.Unlock()
+	if c.mode == mode {
+		return nil
+	}
+	c.mode = mode
+	c.opts.Logger.Warn("judgment mode changed", zap.String("mode", string(mode)))
+	return nil
 }
 
 // Run executes cycles until the context is canceled.
 func (c *Controller) Run(ctx context.Context) {
-	if c.opts.Mode == ModeOff {
+	if c.Mode() == ModeOff {
 		c.opts.Logger.Info("judgment plane disabled")
 		return
 	}
@@ -106,7 +139,7 @@ func (c *Controller) Run(ctx context.Context) {
 // Cycle runs one detection-to-judgment cycle and returns the decisions it
 // audited. It never returns an error: a failing judge is fail-static by design.
 func (c *Controller) Cycle(ctx context.Context) []DecisionRecord {
-	if c.opts.Mode == ModeOff {
+	if c.Mode() == ModeOff {
 		return nil
 	}
 
@@ -214,7 +247,7 @@ func (c *Controller) apply(ctx context.Context, suspects []detect.Suspect, verdi
 			Proposed:            proposed,
 			Current:             current,
 			CurrentSet:          currentSet,
-			Mode:                c.opts.Mode,
+			Mode:                c.Mode(),
 			ActiveIdentities:    activeIdentities,
 			NonNormalIdentities: nonNormal,
 			NewBlocksThisCycle:  c.newBlocksThisCycle,
@@ -256,7 +289,7 @@ func (c *Controller) apply(ctx context.Context, suspects []detect.Suspect, verdi
 		}
 
 		// G10: shadow mode computes and audits everything but never writes.
-		if c.opts.Mode == ModeEnforce && outcome.HasEntry && outcome.Tier != previous {
+		if c.Mode() == ModeEnforce && outcome.HasEntry && outcome.Tier != previous {
 			entry := policy.TierEntry{
 				Tier:       outcome.Tier,
 				Until:      outcome.Until,

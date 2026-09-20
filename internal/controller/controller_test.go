@@ -387,6 +387,30 @@ func TestCycle_MaxNewBlocksPerCycle(t *testing.T) {
 	assert.Contains(t, records[0].Guardrails, GuardrailBlastRadius)
 }
 
+// TestSetMode covers the shadow-to-enforce flip operators use after comparing
+// decision records against ground truth.
+func TestSetMode(t *testing.T) {
+	f := newFixture(t, ModeShadow)
+	require.Equal(t, ModeShadow, f.controller.Mode())
+
+	// In shadow the decision is audited but nothing is written.
+	require.Len(t, f.controller.Cycle(context.Background()), 1)
+	_, ok := f.tiers.Lookup("203.0.113.9", f.clk.Now())
+	require.False(t, ok)
+
+	require.NoError(t, f.controller.SetMode(ModeEnforce))
+	require.Equal(t, ModeEnforce, f.controller.Mode())
+
+	require.Len(t, f.controller.Cycle(context.Background()), 1)
+	_, ok = f.tiers.Lookup("203.0.113.9", f.clk.Now())
+	assert.True(t, ok, "enforce mode writes the tier")
+
+	require.Error(t, f.controller.SetMode("sometimes"))
+	assert.Equal(t, ModeEnforce, f.controller.Mode(), "an invalid mode changes nothing")
+
+	require.NoError(t, f.controller.SetMode(ModeEnforce), "setting the current mode is a no-op")
+}
+
 // TestModeOffDoesNothing checks the off switch.
 func TestModeOffDoesNothing(t *testing.T) {
 	f := newFixture(t, ModeOff)

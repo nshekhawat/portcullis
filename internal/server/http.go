@@ -19,8 +19,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
+	"github.com/nshekhawat/portcullis/internal/controller"
+	"github.com/nshekhawat/portcullis/internal/judge"
 	"github.com/nshekhawat/portcullis/internal/metrics"
+	"github.com/nshekhawat/portcullis/internal/policy"
 	"github.com/nshekhawat/portcullis/internal/ratelimiter"
+	"github.com/nshekhawat/portcullis/internal/signals"
 	"github.com/nshekhawat/portcullis/internal/storage"
 )
 
@@ -65,6 +69,25 @@ type HTTPConfig struct {
 
 	// Metrics, when set, records HTTP request metrics. Optional.
 	Metrics *metrics.Metrics
+
+	// Tiers is the enforcement tier store the admin API reads and writes.
+	// Optional: with none configured the tier endpoints answer 503.
+	Tiers policy.TierStore
+	// Audit is the decision ring the admin API reads. Optional: with none
+	// configured the decisions endpoint answers 503.
+	Audit *controller.AuditRing
+	// Mode is the judgment-mode surface. Optional: with none configured the
+	// mode endpoints answer 503.
+	Mode ModeController
+	// Signals receives observations from /v1/check and /v1/report. Optional:
+	// with none configured observations are dropped.
+	Signals signals.Recorder
+	// TierConfigs supplies the default TTL for a tier when a manual entry
+	// omits one.
+	TierConfigs map[policy.Tier]policy.TierConfig
+	// MaxTTL caps every manual tier entry. Zero means no cap beyond the
+	// built-in default.
+	MaxTTL time.Duration
 }
 
 // DefaultHTTPConfig returns default HTTP configuration.
@@ -137,14 +160,31 @@ func (s *HTTPServer) setupRoutes() {
 	public := s.engine.Group("")
 	public.Use(corsMiddleware(s.config.CORSOrigins))
 	public.POST("/v1/check", s.checkHandler)
+	public.POST("/v1/report", s.reportHandler)
 
-	admin := s.engine.Group("/v1/admin", s.adminAuthMiddleware())
-	admin.GET("/status/:key", s.statusHandler)
-	admin.DELETE("/reset/:key", s.resetHandler)
+	s.RegisterAdminRoutes(s.engine)
 
 	legacy := s.engine.Group("/v1", s.adminAuthMiddleware())
 	legacy.GET("/status/:key", s.statusHandler)
 	legacy.DELETE("/reset/:key", s.resetHandler)
+}
+
+// RegisterAdminRoutes mounts the admin API on a router, with the bearer-token
+// middleware applied.
+//
+// It exists so gateway mode can serve the same admin API on its separate
+// listener instead of duplicating the handlers.
+func (s *HTTPServer) RegisterAdminRoutes(router gin.IRouter) {
+	admin := router.Group("/v1/admin", s.adminAuthMiddleware())
+	admin.GET("/status/:key", s.statusHandler)
+	admin.DELETE("/reset/:key", s.resetHandler)
+	admin.GET("/tiers", s.listTiersHandler)
+	admin.PUT("/tiers/:identity", s.setTierHandler)
+	admin.DELETE("/tiers/:identity", s.clearTierHandler)
+	admin.DELETE("/tiers", s.clearAllTiersHandler)
+	admin.GET("/decisions", s.listDecisionsHandler)
+	admin.GET("/config/mode", s.getModeHandler)
+	admin.PUT("/config/mode", s.setModeHandler)
 }
 
 // prefixStrings renders prefixes for gin's trusted-proxy setting.
@@ -314,11 +354,20 @@ func corsMiddleware(origins []string) gin.HandlerFunc {
 
 // Handlers
 
+// Attributes describes the request a check is being made for. Optional, and
+// only fed to the signals pipeline: it never affects the decision.
+type Attributes struct {
+	Path      string `json:"path"`
+	Method    string `json:"method"`
+	UserAgent string `json:"user_agent"`
+}
+
 // CheckRequest represents a rate limit check request.
 type CheckRequest struct {
-	Identifier string `json:"identifier" binding:"required"`
-	Resource   string `json:"resource"`
-	Tokens     int64  `json:"tokens"`
+	Identifier string      `json:"identifier" binding:"required"`
+	Resource   string      `json:"resource"`
+	Tokens     int64       `json:"tokens"`
+	Attributes *Attributes `json:"attributes,omitempty"`
 }
 
 // CheckResponse represents a rate limit check response.
@@ -343,6 +392,16 @@ func (s *HTTPServer) checkHandler(c *gin.Context) {
 	if err != nil {
 		s.writeLimiterError(c, err)
 		return
+	}
+
+	// The caller told us what the request was, so the detection plane gets to
+	// see it. This is a best-effort handoff and never changes the decision.
+	if req.Attributes != nil {
+		s.observe(observation(
+			req.Identifier, req.Resource,
+			req.Attributes.Path, req.Attributes.Method, req.Attributes.UserAgent,
+			0, decision.Allowed,
+		))
 	}
 
 	resp := CheckResponse{
@@ -476,4 +535,240 @@ func (s *HTTPServer) readyHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ready"})
+}
+
+// Admin and report handlers
+
+// observe hands an observation to the signals pipeline when one is configured.
+// Recording is best-effort by contract, so a missing recorder drops silently.
+func (s *HTTPServer) observe(obs *signals.Observation) {
+	if s.config.Signals == nil {
+		return
+	}
+	s.config.Signals.Record(*obs)
+}
+
+// ReportRequest is a request the caller already served.
+type ReportRequest struct {
+	Identifier string `json:"identifier" binding:"required"`
+	Resource   string `json:"resource"`
+	Status     int    `json:"status"`
+	Path       string `json:"path"`
+	Method     string `json:"method"`
+	UserAgent  string `json:"user_agent"`
+}
+
+// reportHandler records a request the caller already served, so traffic that
+// never passed through the gateway still reaches the detection plane. The
+// caller reports what it handled, so the observation is scored as allowed.
+func (s *HTTPServer) reportHandler(c *gin.Context) {
+	var req ReportRequest
+	if !s.bindJSON(c, &req) {
+		return
+	}
+
+	s.observe(observation(
+		req.Identifier, req.Resource, req.Path, req.Method, req.UserAgent,
+		req.Status, true,
+	))
+
+	c.JSON(http.StatusAccepted, gin.H{"accepted": true})
+}
+
+// tiersOr503 returns the tier store, answering 503 when none is configured.
+func (s *HTTPServer) tiersOr503(c *gin.Context) (policy.TierStore, bool) {
+	if s.config.Tiers == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "tier store not configured"})
+		return nil, false
+	}
+	return s.config.Tiers, true
+}
+
+func (s *HTTPServer) listTiersHandler(c *gin.Context) {
+	tiers, ok := s.tiersOr503(c)
+	if !ok {
+		return
+	}
+
+	entries, err := tiers.List(c.Request.Context())
+	if err != nil {
+		s.logger.Error("failed to list tiers", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"tiers": sortedTierViews(entries)})
+}
+
+// setTierRequest is the body of PUT /v1/admin/tiers/:identity.
+type setTierRequest struct {
+	Tier   string `json:"tier" binding:"required"`
+	TTL    string `json:"ttl"`
+	Reason string `json:"reason"`
+}
+
+func (s *HTTPServer) setTierHandler(c *gin.Context) {
+	tiers, ok := s.tiersOr503(c)
+	if !ok {
+		return
+	}
+
+	var req setTierRequest
+	if !s.bindJSON(c, &req) {
+		return
+	}
+
+	tier, err := policy.ParseTier(req.Tier)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var requested time.Duration
+	if req.TTL != "" {
+		if requested, err = time.ParseDuration(req.TTL); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid ttl"})
+			return
+		}
+	}
+
+	identity := c.Param("identity")
+	ttl := manualTTL(requested, tierTTL(s.config.TierConfigs, tier), s.config.MaxTTL)
+	entry := policy.TierEntry{
+		Tier:   tier,
+		Until:  time.Now().Add(ttl),
+		Source: manualTierSource,
+	}
+
+	if err := tiers.Set(c.Request.Context(), identity, entry); err != nil {
+		s.logger.Error("failed to set tier", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+
+	s.logger.Info("manual tier set",
+		zap.String("tier", tier.String()),
+		zap.Duration("ttl", ttl),
+		zap.String("reason", req.Reason))
+
+	c.JSON(http.StatusOK, newTierView(identity, entry))
+}
+
+func (s *HTTPServer) clearTierHandler(c *gin.Context) {
+	tiers, ok := s.tiersOr503(c)
+	if !ok {
+		return
+	}
+
+	if err := tiers.Delete(c.Request.Context(), c.Param("identity")); err != nil {
+		s.logger.Error("failed to clear tier", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+
+	c.Status(http.StatusNoContent)
+}
+
+// Bulk delete confirmation.
+const (
+	allConfirmHeader = "X-Portcullis-Confirm"
+	allConfirmValue  = "all"
+)
+
+// clearAllTiersHandler empties the tier store. It is destructive and
+// unauthenticated-by-accident-prone, so it needs both ?all=true and an explicit
+// confirmation header.
+func (s *HTTPServer) clearAllTiersHandler(c *gin.Context) {
+	tiers, ok := s.tiersOr503(c)
+	if !ok {
+		return
+	}
+
+	if c.Query("all") != "true" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "all=true is required"})
+		return
+	}
+	if c.GetHeader(allConfirmHeader) != allConfirmValue {
+		c.JSON(http.StatusBadRequest, gin.H{"error": allConfirmHeader + " must be " + allConfirmValue})
+		return
+	}
+
+	entries, err := tiers.List(c.Request.Context())
+	if err != nil {
+		s.logger.Error("failed to list tiers", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	for identity := range entries {
+		if err := tiers.Delete(c.Request.Context(), identity); err != nil {
+			s.logger.Error("failed to clear tier", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+			return
+		}
+	}
+
+	c.Status(http.StatusNoContent)
+}
+
+func (s *HTTPServer) listDecisionsHandler(c *gin.Context) {
+	if s.config.Audit == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "audit ring not configured"})
+		return
+	}
+
+	limit := 0
+	if raw := c.Query("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid limit"})
+			return
+		}
+		limit = parsed
+	}
+
+	records := s.config.Audit.List(controller.Filter{
+		Limit:    decisionLimit(limit),
+		Identity: c.Query("identity"),
+		Label:    judge.Label(c.Query("label")),
+	})
+
+	c.JSON(http.StatusOK, gin.H{"decisions": records})
+}
+
+func (s *HTTPServer) getModeHandler(c *gin.Context) {
+	if s.config.Mode == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "mode controller not configured"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"mode": string(s.config.Mode.Mode())})
+}
+
+// setModeRequest is the body of PUT /v1/admin/config/mode.
+type setModeRequest struct {
+	Mode string `json:"mode" binding:"required"`
+}
+
+func (s *HTTPServer) setModeHandler(c *gin.Context) {
+	if s.config.Mode == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "mode controller not configured"})
+		return
+	}
+
+	var req setModeRequest
+	if !s.bindJSON(c, &req) {
+		return
+	}
+
+	mode, err := parseMode(req.Mode)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := s.config.Mode.SetMode(mode); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"mode": string(mode)})
 }

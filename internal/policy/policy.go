@@ -8,6 +8,7 @@ package policy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -61,6 +62,36 @@ func Escalate(a, b Tier) Tier {
 		return a
 	}
 	return b
+}
+
+// MarshalJSON encodes a tier as its configuration name, so the admin API and
+// the Redis tier hash stay readable.
+func (t Tier) MarshalJSON() ([]byte, error) {
+	return json.Marshal(t.String())
+}
+
+// UnmarshalJSON accepts either the name or the numeric value. The numeric form
+// is what older entries in the Redis tier hash look like.
+func (t *Tier) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := json.Unmarshal(data, &name); err == nil {
+		parsed, err := ParseTier(name)
+		if err != nil {
+			return err
+		}
+		*t = parsed
+		return nil
+	}
+
+	var value uint8
+	if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("tier must be a name or a number: %w", err)
+	}
+	if int(value) >= len(tierNames) {
+		return fmt.Errorf("unknown tier value %d", value)
+	}
+	*t = Tier(value)
+	return nil
 }
 
 // TierEntry is an identity's current enforcement state.

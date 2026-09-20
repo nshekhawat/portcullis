@@ -75,6 +75,53 @@ Read this section before upgrading.
 
 ### Added
 
+- **Signals plane** (`internal/signals`): a sharded observation aggregator with
+  rolling sub-buckets, Welford inter-arrival statistics, reservoir-sampled paths
+  and bounded identities. `Record` is a non-blocking channel send (measured
+  ~20 ns/op, 0 allocs); a full buffer drops and counts.
+- **Detection plane** (`internal/detect`): rolling median/MAD baselines, seven
+  weighted features, deterministic hard-evidence flags (`rate_over_hard_ceiling`,
+  `auth_fail_ratio_high`, `scanner_paths`, `prefix_campaign`) and top-N
+  selection. 100k identities are ranked in ~9.7 ms per cycle.
+- **Judgment plane** (`internal/judge`, `internal/controller`): the TypeSafe
+  System One client, an offline deterministic rules judge, a mock judge, a
+  bounded budget, an in-house circuit breaker, a per-replica audit ring and
+  guardrails G1–G10 as pure functions.
+- **Enforcement tiers** (`internal/policy`): `normal` < `watch` < `throttle` <
+  `strict` < `block`, with an allocation-free in-memory store and a Redis store
+  that mirrors the tier hash over pub/sub with a 10 s resync.
+- **Gateway mode**: `portcullis gateway` reverse-proxies an application with the
+  same pipeline, plus a separate listener for health and admin endpoints that is
+  never proxied.
+- **Admin API and CLI**: tier CRUD, the decision audit trail and runtime mode
+  changes over HTTP and gRPC, with `portcullis admin tiers --watch`,
+  `decisions`, `set-tier`, `clear-tier` and `mode`.
+- **Demo stack** (`deploy/demo`): two gateway replicas behind nginx, a demo
+  upstream, the fake judge, Redis, the traffic generator, and optional
+  Prometheus and Grafana with a provisioned dashboard.
+- **`cmd/mockjev`**: a fake TypeSafe server used by the demo and the
+  end-to-end tests, with latency, jitter, failure and rate-limit simulation and
+  a runtime chaos switch.
+- **`cmd/trafficgen`**: the reproducible traffic shapes (users, burst, scraper,
+  stuffing, scanner, flood, retrystorm, outage, mixed).
+- **End-to-end suite** (`test/e2e`, tag `e2e`): the whole loop in-process, with
+  every §7.3 scenario, the outage/fail-static behavior, the p99 latency budget
+  and the "a blocked identity never reaches the application" requirement.
+- New metrics for the judgment plane, none of which carry an identity, path or
+  user agent label.
+- `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, `docs/BENCHMARKS.md` and
+  `scripts/demo-walkthrough.md`.
+
+### Known deviations from docs/SPEC.md
+
+- The spec's rules judge reports `scraper` at 0.75 while its policy matrix puts
+  `throttle` at 0.8. Both values are implemented literally, which means an
+  offline deployment (no model) reaches `watch`, not `throttle`, for a scraper.
+  The end-to-end test asserts the reachable tier and the spec records the
+  discrepancy.
+- The audit ring is per replica in memory; the tier table is shared. Querying one
+  replica can therefore miss the decision record that produced a tier another
+  replica holds.
 - `server.trusted_proxies` and client IP resolution that ignores
   `X-Forwarded-For` from untrusted peers (B2).
 - `memory.max_keys` and `memory.cleanup_interval`; the in-memory backend uses

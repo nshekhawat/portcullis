@@ -1,4 +1,4 @@
-.PHONY: all build test test-short test-integration e2e bench lint fmt tidy proto docker ci clean install-tools help
+.PHONY: all build test test-short test-integration e2e bench lint fmt tidy proto docker docker-demo ci demo demo-outage demo-down clean install-tools help
 
 # Variables
 BINARY_NAME=portcullis
@@ -124,6 +124,70 @@ docker-run: docker
 	@echo "Running with Docker..."
 	docker run -p 8080:8080 -p 9090:9090 $(DOCKER_IMAGE):latest
 
+# --- Demo stack -------------------------------------------------------------
+
+DEMO_DIR=deploy/demo
+DEMO_COMPOSE=docker compose -f $(DEMO_DIR)/docker-compose.yaml
+DEMO_ADMIN_URL=http://127.0.0.1:8001
+DEMO_ADMIN_TOKEN=demo-admin-token
+DEMO_TRAFFIC_SECONDS?=120
+# Judge selection:
+#   JUDGE=mockjev (default) runs the real TypeSafe client against the fake
+#                           server in the stack, so no API key is needed.
+#   JUDGE=typesafe          points the same client at api.typesafe.ai and
+#                           requires TYPESAFE_API_KEY to be set.
+JUDGE?=mockjev
+ifeq ($(JUDGE),typesafe)
+DEMO_TYPESAFE_BASE_URL=https://api.typesafe.ai
+else
+DEMO_TYPESAFE_BASE_URL=http://mockjev:8099
+endif
+
+# Bring the demo stack up, drive it, and print the live tier table.
+#   make demo                  fake TypeSafe judge, no API key needed
+#   make demo JUDGE=typesafe   real TypeSafe judge, needs TYPESAFE_API_KEY
+demo: build
+ifeq ($(JUDGE),typesafe)
+	@if [ -z "$$TYPESAFE_API_KEY" ]; then \
+		echo "JUDGE=typesafe needs TYPESAFE_API_KEY to be set" >&2; exit 1; \
+	fi
+endif
+	@echo "Starting the demo stack (judge=$(JUDGE))..."
+	TYPESAFE_BASE_URL=$(DEMO_TYPESAFE_BASE_URL) TYPESAFE_API_KEY=$${TYPESAFE_API_KEY} \
+		$(DEMO_COMPOSE) up -d --build redis upstream mockjev gateway-a gateway-b nginx
+	@echo "Waiting for the gateway to be ready..."
+	@for i in $$(seq 1 60); do 		if curl -sf http://127.0.0.1:8001/ready >/dev/null 2>&1; then break; fi; 		sleep 1; 	done
+	@echo "Generating $(DEMO_TRAFFIC_SECONDS)s of mixed traffic..."
+	$(DEMO_COMPOSE) --profile tools run --rm -T trafficgen 		-scenario mixed -duration $(DEMO_TRAFFIC_SECONDS)s -target http://nginx:8000 &
+	@sleep 2
+	@echo "Live tier table (Ctrl-C to stop watching; traffic keeps flowing):"
+	-./$(BUILD_DIR)/$(BINARY_NAME) admin tiers --watch --interval 2s 		--url $(DEMO_ADMIN_URL) --token $(DEMO_ADMIN_TOKEN)
+	@echo "Waiting for the traffic run to finish..."
+	@wait
+	@echo
+	@echo "=== verdict summary ==="
+	-./$(BUILD_DIR)/$(BINARY_NAME) admin decisions --limit 25 		--url $(DEMO_ADMIN_URL) --token $(DEMO_ADMIN_TOKEN)
+	@echo
+	@echo "Flip to enforce with:"
+	@echo "  ./$(BUILD_DIR)/$(BINARY_NAME) admin mode enforce --url $(DEMO_ADMIN_URL) --token $(DEMO_ADMIN_TOKEN)"
+
+# Show the breaker opening while traffic keeps flowing.
+demo-outage: 
+	@echo "Failing the judge for 30s..."
+	curl -sf -X POST -d '{"fail_rate":1}' http://127.0.0.1:8099/chaos >/dev/null
+	sleep 30
+	curl -sf -X POST -d '{"fail_rate":0}' http://127.0.0.1:8099/chaos >/dev/null
+	@echo "Judge recovered. Breaker state and tiers:"
+	-./$(BUILD_DIR)/$(BINARY_NAME) admin tiers --url $(DEMO_ADMIN_URL) --token $(DEMO_ADMIN_TOKEN)
+
+# Tear the demo stack down, including volumes.
+demo-down:
+	$(DEMO_COMPOSE) --profile tools --profile observability down -v
+
+# Bring up Prometheus and Grafana alongside the stack.
+demo-observability:
+	$(DEMO_COMPOSE) --profile observability up -d prometheus grafana
+
 # Clean build artifacts
 clean:
 	@echo "Cleaning build artifacts..."
@@ -160,6 +224,9 @@ help:
 	@echo "  deps             - Download dependencies"
 	@echo "  proto            - Generate protobuf code"
 	@echo "  docker           - Build Docker image"
+	@echo "  demo             - Run the demo stack (JUDGE=typesafe for the real model)"
+	@echo "  demo-outage      - Fail the judge for 30s and show fail-static behavior"
+	@echo "  demo-down        - Tear the demo stack down"
 	@echo "  docker-run       - Build and run the container"
 	@echo "  clean            - Clean build artifacts"
 	@echo "  install-tools    - Install development tools"
