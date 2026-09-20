@@ -14,8 +14,8 @@ import (
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/nshekhawat/rate-limiter-go/api/proto"
-	"github.com/nshekhawat/rate-limiter-go/internal/ratelimiter"
+	pb "github.com/nshekhawat/portcullis/api/proto/portcullis/v1"
+	"github.com/nshekhawat/portcullis/internal/ratelimiter"
 )
 
 // GRPCServer represents the gRPC API server.
@@ -88,7 +88,7 @@ func NewGRPCServer(limiter *ratelimiter.RateLimiter, config *GRPCConfig, logger 
 		s.healthServer = health.NewServer()
 		healthpb.RegisterHealthServer(grpcServer, s.healthServer)
 		s.healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
-		s.healthServer.SetServingStatus("ratelimiter.RateLimiterService", healthpb.HealthCheckResponse_SERVING)
+		s.healthServer.SetServingStatus("portcullis.v1.RateLimiterService", healthpb.HealthCheckResponse_SERVING)
 	}
 
 	return s
@@ -116,7 +116,7 @@ func (s *GRPCServer) Stop() {
 	s.logger.Info("stopping gRPC server")
 	if s.healthServer != nil {
 		s.healthServer.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
-		s.healthServer.SetServingStatus("ratelimiter.RateLimiterService", healthpb.HealthCheckResponse_NOT_SERVING)
+		s.healthServer.SetServingStatus("portcullis.v1.RateLimiterService", healthpb.HealthCheckResponse_NOT_SERVING)
 	}
 	s.server.GracefulStop()
 }

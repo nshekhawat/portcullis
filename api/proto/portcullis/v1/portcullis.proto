@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package ratelimiter;
+package portcullis.v1;
 
-option go_package = "github.com/nshekhawat/rate-limiter-go/api/proto";
+option go_package = "github.com/nshekhawat/portcullis/api/proto/portcullis/v1;portcullisv1";
 
 service RateLimiterService {
   // CheckRateLimit checks if a request should be allowed based on rate limiting rules

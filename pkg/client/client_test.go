@@ -15,7 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/nshekhawat/rate-limiter-go/api/proto"
+	pb "github.com/nshekhawat/portcullis/api/proto/portcullis/v1"
 )
 
 // Mock gRPC server for testing

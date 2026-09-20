@@ -32,7 +32,7 @@ type Metrics struct {
 var DefaultMetrics *Metrics
 
 func init() {
-	DefaultMetrics = NewMetrics("ratelimiter")
+	DefaultMetrics = NewMetrics("portcullis")
 }
 
 // NewMetrics creates a new Metrics instance with the given namespace.

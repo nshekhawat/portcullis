@@ -1,8 +1,9 @@
-// Package main provides the entry point for the rate limiter service.
 package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -12,93 +13,90 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/nshekhawat/rate-limiter-go/internal/config"
-	"github.com/nshekhawat/rate-limiter-go/internal/metrics"
-	"github.com/nshekhawat/rate-limiter-go/internal/ratelimiter"
-	"github.com/nshekhawat/rate-limiter-go/internal/server"
-	"github.com/nshekhawat/rate-limiter-go/internal/storage"
+	"github.com/nshekhawat/portcullis/internal/config"
+	"github.com/nshekhawat/portcullis/internal/metrics"
+	"github.com/nshekhawat/portcullis/internal/ratelimiter"
+	"github.com/nshekhawat/portcullis/internal/server"
+	"github.com/nshekhawat/portcullis/internal/storage"
 )
 
-func main() {
-	// Get config path from env or use default
-	configPath := os.Getenv("CONFIG_PATH")
-
-	// Load configuration
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
-		os.Exit(1)
+// runServe starts the HTTP and gRPC check APIs.
+func runServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	configPath := fs.String("config", os.Getenv("CONFIG_PATH"), "path to the configuration file")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
 	}
 
-	// Initialize logger
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
 	logger, err := initLogger(cfg.Logging)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to initialize logger: %w", err)
 	}
 	defer func() { _ = logger.Sync() }()
 
-	logger.Info("starting rate limiter service",
-		zap.String("version", "1.0.0"),
-	)
+	config.LogDeprecationOnce(func() {
+		for _, name := range cfg.Deprecations {
+			logger.Warn("deprecated environment variable used; switch to the PORTCULLIS_ prefix",
+				zap.String("legacy", name),
+			)
+		}
+	})
 
-	// Initialize storage
+	logger.Info("starting portcullis service", zap.String("version", version), zap.String("commit", commit))
+
 	store, err := initStorage(cfg, logger)
 	if err != nil {
-		logger.Fatal("failed to initialize storage", zap.Error(err))
+		return fmt.Errorf("failed to initialize storage: %w", err)
 	}
 	defer func() { _ = store.Close() }()
 
-	// Verify storage connectivity
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	if err := store.Ping(ctx); err != nil {
-		logger.Fatal("storage ping failed", zap.Error(err))
+		return fmt.Errorf("storage ping failed: %w", err)
 	}
-	cancel()
 	logger.Info("storage connected successfully")
 
-	// Initialize rate limiter using the config helper
-	limiterConfig := cfg.ToRateLimiterConfig()
-	limiter := ratelimiter.NewRateLimiter(store, limiterConfig, logger)
+	limiter := ratelimiter.NewRateLimiter(store, cfg.ToRateLimiterConfig(), logger)
 
-	// Start servers
 	errCh := make(chan error, 2)
 
-	// Start HTTP server
-	httpConfig := &server.HTTPConfig{
+	httpServer := server.NewHTTPServer(limiter, &server.HTTPConfig{
 		Port:           cfg.Server.HTTPPort,
 		ReadTimeout:    cfg.Server.ReadTimeout,
 		WriteTimeout:   cfg.Server.WriteTimeout,
 		MetricsEnabled: cfg.Metrics.Enabled,
 		MetricsPath:    cfg.Metrics.Path,
-	}
-	httpServer := server.NewHTTPServer(limiter, httpConfig, logger)
+	}, logger)
 
 	go func() {
-		logger.Info("starting HTTP server", zap.Int("port", cfg.Server.HTTPPort))
 		if err := httpServer.Start(); err != nil {
 			errCh <- fmt.Errorf("HTTP server error: %w", err)
 		}
 	}()
 
-	// Start gRPC server
-	grpcConfig := &server.GRPCConfig{
+	grpcServer := server.NewGRPCServer(limiter, &server.GRPCConfig{
 		Port:              cfg.Server.GRPCPort,
 		MaxRecvMsgSize:    4 * 1024 * 1024,
 		MaxSendMsgSize:    4 * 1024 * 1024,
 		EnableReflection:  true,
 		EnableHealthCheck: true,
-	}
-	grpcServer := server.NewGRPCServer(limiter, grpcConfig, logger)
+	}, logger)
 
 	go func() {
-		logger.Info("starting gRPC server", zap.Int("port", cfg.Server.GRPCPort))
 		if err := grpcServer.Start(); err != nil {
 			errCh <- fmt.Errorf("gRPC server error: %w", err)
 		}
 	}()
 
-	// Wait for shutdown signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -109,21 +107,19 @@ func main() {
 		logger.Info("received shutdown signal", zap.String("signal", sig.String()))
 	}
 
-	// Graceful shutdown
 	logger.Info("shutting down servers...")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
-	// Stop HTTP server
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("HTTP server shutdown error", zap.Error(err))
 	}
 
-	// Stop gRPC server
 	grpcServer.Stop()
 
 	logger.Info("servers stopped successfully")
+	return nil
 }
 
 func initLogger(cfg config.LoggingConfig) (*zap.Logger, error) {
@@ -141,7 +137,7 @@ func initLogger(cfg config.LoggingConfig) (*zap.Logger, error) {
 		Development:      false,
 		Encoding:         cfg.Format,
 		EncoderConfig:    encoderConfig,
-		OutputPaths:      []string{"stdout"},
+		OutputPaths:      []string{cfg.Output},
 		ErrorOutputPaths: []string{"stderr"},
 	}
 
@@ -149,13 +145,10 @@ func initLogger(cfg config.LoggingConfig) (*zap.Logger, error) {
 }
 
 func initStorage(cfg *config.Config, logger *zap.Logger) (storage.AtomicStorage, error) {
-	// Check if Redis is configured (non-empty address indicates Redis should be used)
-	useRedis := os.Getenv("RATE_LIMITER_USE_REDIS") == "true"
+	useRedis := os.Getenv("PORTCULLIS_USE_REDIS") == "true" || os.Getenv("RATE_LIMITER_USE_REDIS") == "true"
 
 	if useRedis {
-		logger.Info("initializing Redis storage",
-			zap.String("address", cfg.Redis.Address),
-		)
+		logger.Info("initializing Redis storage", zap.String("address", cfg.Redis.Address))
 		redisConfig := &storage.RedisConfig{
 			Address:      cfg.Redis.Address,
 			Password:     cfg.Redis.Password,
@@ -165,12 +158,12 @@ func initStorage(cfg *config.Config, logger *zap.Logger) (storage.AtomicStorage,
 			DialTimeout:  cfg.Redis.DialTimeout,
 			ReadTimeout:  cfg.Redis.ReadTimeout,
 			WriteTimeout: cfg.Redis.WriteTimeout,
+			MaxRetries:   cfg.Redis.MaxRetries,
 		}
 		store, err := storage.NewRedisStorage(redisConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Redis storage: %w", err)
 		}
-		// Wrap with instrumented storage
 		return metrics.NewInstrumentedAtomicStorage(store, "redis", nil), nil
 	}
 

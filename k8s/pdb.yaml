@@ -1,11 +1,11 @@
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: rate-limiter
+  name: portcullis
   labels:
-    app: rate-limiter
+    app: portcullis
 spec:
   minAvailable: 2
   selector:
     matchLabels:
-      app: rate-limiter
+      app: portcullis

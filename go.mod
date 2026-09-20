@@ -1,4 +1,4 @@
-module github.com/nshekhawat/rate-limiter-go
+module github.com/nshekhawat/portcullis
 
 go 1.25.4
 

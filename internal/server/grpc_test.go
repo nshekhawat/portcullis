@@ -14,9 +14,9 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/nshekhawat/rate-limiter-go/api/proto"
-	"github.com/nshekhawat/rate-limiter-go/internal/ratelimiter"
-	"github.com/nshekhawat/rate-limiter-go/internal/storage"
+	pb "github.com/nshekhawat/portcullis/api/proto/portcullis/v1"
+	"github.com/nshekhawat/portcullis/internal/ratelimiter"
+	"github.com/nshekhawat/portcullis/internal/storage"
 )
 
 func setupGRPCTest(t *testing.T) (pb.RateLimiterServiceClient, healthpb.HealthClient, func()) {
@@ -251,7 +251,7 @@ func TestGRPCServer_HealthCheck(t *testing.T) {
 
 	t.Run("service health", func(t *testing.T) {
 		resp, err := healthClient.Check(ctx, &healthpb.HealthCheckRequest{
-			Service: "ratelimiter.RateLimiterService",
+			Service: "portcullis.v1.RateLimiterService",
 		})
 		require.NoError(t, err)
 		assert.Equal(t, healthpb.HealthCheckResponse_SERVING, resp.Status)

@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
-	"github.com/nshekhawat/rate-limiter-go/internal/storage"
+	"github.com/nshekhawat/portcullis/internal/storage"
 )
 
 func newTestRateLimiter(t *testing.T) (*RateLimiter, func()) {

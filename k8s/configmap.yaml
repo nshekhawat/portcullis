@@ -1,9 +1,9 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: rate-limiter-config
+  name: portcullis-config
   labels:
-    app: rate-limiter
+    app: portcullis
 data:
   config.yaml: |
     server:

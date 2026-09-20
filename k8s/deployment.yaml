@@ -1,27 +1,27 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rate-limiter
+  name: portcullis
   labels:
-    app: rate-limiter
+    app: portcullis
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: rate-limiter
+      app: portcullis
   template:
     metadata:
       labels:
-        app: rate-limiter
+        app: portcullis
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
-      serviceAccountName: rate-limiter
+      serviceAccountName: portcullis
       containers:
-        - name: rate-limiter
-          image: rate-limiter:latest
+        - name: portcullis
+          image: portcullis:latest
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -33,7 +33,7 @@ spec:
           env:
             - name: CONFIG_PATH
               value: "/config/config.yaml"
-            - name: RATE_LIMITER_USE_REDIS
+            - name: PORTCULLIS_USE_REDIS
               value: "true"
           volumeMounts:
             - name: config
@@ -73,7 +73,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: rate-limiter-config
+            name: portcullis-config
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -81,5 +81,5 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: rate-limiter
+                    app: portcullis
                 topologyKey: kubernetes.io/hostname

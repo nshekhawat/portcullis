@@ -11,9 +11,9 @@ resources:
   - redis.yaml
 
 commonLabels:
-  app.kubernetes.io/name: rate-limiter
+  app.kubernetes.io/name: portcullis
   app.kubernetes.io/component: rate-limiting
 
 images:
-  - name: rate-limiter
+  - name: portcullis
     newTag: latest

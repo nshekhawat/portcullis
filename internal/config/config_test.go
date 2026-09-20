@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/nshekhawat/rate-limiter-go/internal/ratelimiter"
+	"github.com/nshekhawat/portcullis/internal/ratelimiter"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -32,7 +32,7 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, 3, cfg.Redis.MaxRetries)
 
 	// Rate limit defaults
-	assert.Equal(t, "ratelimit:", cfg.RateLimit.KeyPrefix)
+	assert.Equal(t, "pc:", cfg.RateLimit.KeyPrefix)
 	assert.False(t, cfg.RateLimit.EnableBypass)
 	assert.Len(t, cfg.RateLimit.DefaultRules, 1)
 	assert.Equal(t, "default", cfg.RateLimit.DefaultRules[0].Name)
@@ -269,12 +269,8 @@ server:
 	require.NoError(t, err)
 
 	// Set environment variables
-	os.Setenv("RATE_LIMITER_SERVER_HTTP_PORT", "8888")
-	os.Setenv("RATE_LIMITER_REDIS_ADDRESS", "env-redis:6379")
-	defer func() {
-		os.Unsetenv("RATE_LIMITER_SERVER_HTTP_PORT")
-		os.Unsetenv("RATE_LIMITER_REDIS_ADDRESS")
-	}()
+	t.Setenv("PORTCULLIS_SERVER_HTTP_PORT", "8888")
+	t.Setenv("PORTCULLIS_REDIS_ADDRESS", "env-redis:6379")
 
 	cfg, err := Load(configPath)
 	require.NoError(t, err)
@@ -282,6 +278,36 @@ server:
 	// Environment variables should override config file
 	assert.Equal(t, 8888, cfg.Server.HTTPPort)
 	assert.Equal(t, "env-redis:6379", cfg.Redis.Address)
+	assert.Empty(t, cfg.Deprecations)
+}
+
+func TestLoad_LegacyEnvPrefixHonored(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte("server:\n  http_port: 8080\n"), 0644))
+
+	t.Setenv("RATE_LIMITER_SERVER_HTTP_PORT", "9999")
+
+	cfg, err := Load(configPath)
+	require.NoError(t, err)
+
+	assert.Equal(t, 9999, cfg.Server.HTTPPort)
+	assert.Contains(t, cfg.Deprecations, "RATE_LIMITER_SERVER_HTTP_PORT")
+}
+
+func TestLoad_CurrentEnvPrefixWins(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte("server:\n  http_port: 8080\n"), 0644))
+
+	t.Setenv("PORTCULLIS_SERVER_HTTP_PORT", "7777")
+	t.Setenv("RATE_LIMITER_SERVER_HTTP_PORT", "9999")
+
+	cfg, err := Load(configPath)
+	require.NoError(t, err)
+
+	assert.Equal(t, 7777, cfg.Server.HTTPPort)
+	assert.Empty(t, cfg.Deprecations)
 }
 
 func TestLoad_InvalidFile(t *testing.T) {

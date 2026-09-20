@@ -1,9 +1,9 @@
 .PHONY: all build test lint clean docker proto run help
 
 # Variables
-BINARY_NAME=ratelimiter
+BINARY_NAME=portcullis
 BUILD_DIR=bin
-DOCKER_IMAGE=rate-limiter
+DOCKER_IMAGE=portcullis
 DOCKER_TAG=latest
 GO_FILES=$(shell find . -name '*.go' -not -path './vendor/*')
 PROTO_FILES=$(shell find api/proto -name '*.proto')
@@ -18,13 +18,13 @@ all: lint test build
 build:
 	@echo "Building $(BINARY_NAME)..."
 	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/ratelimiter
+	CGO_ENABLED=0 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/portcullis
 
 # Build for Linux (cross-compilation)
 build-linux:
 	@echo "Building $(BINARY_NAME) for Linux..."
 	@mkdir -p $(BUILD_DIR)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/ratelimiter
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/portcullis
 
 # Run the service
 run: build
@@ -34,7 +34,7 @@ run: build
 # Run with Redis
 run-redis: build
 	@echo "Running $(BINARY_NAME) with Redis..."
-	RATE_LIMITER_USE_REDIS=true ./$(BUILD_DIR)/$(BINARY_NAME)
+	PORTCULLIS_USE_REDIS=true ./$(BUILD_DIR)/$(BINARY_NAME)
 
 # Run tests
 test:

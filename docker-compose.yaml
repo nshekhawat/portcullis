@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  rate-limiter:
+  portcullis:
     build:
       context: .
       dockerfile: Dockerfile
@@ -10,8 +10,8 @@ services:
       - "9090:9090"
     environment:
       - CONFIG_PATH=/config/config.yaml
-      - RATE_LIMITER_USE_REDIS=true
-      - RATE_LIMITER_REDIS_ADDRESS=redis:6379
+      - PORTCULLIS_USE_REDIS=true
+      - PORTCULLIS_REDIS_ADDRESS=redis:6379
     volumes:
       - ./config.yaml.example:/config/config.yaml:ro
     depends_on:

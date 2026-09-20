@@ -10,7 +10,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/nshekhawat/rate-limiter-go/internal/storage"
+	"github.com/nshekhawat/portcullis/internal/storage"
 )
 
 // Rule defines a rate limiting rule.
@@ -55,7 +55,7 @@ type Config struct {
 // DefaultConfig returns a default rate limiter configuration.
 func DefaultConfig() *Config {
 	return &Config{
-		KeyPrefix: "ratelimit:",
+		KeyPrefix: "pc:",
 		DefaultRule: &Rule{
 			Name:       "default",
 			Capacity:   100,

@@ -3,13 +3,26 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/viper"
 
-	"github.com/nshekhawat/rate-limiter-go/internal/ratelimiter"
+	"github.com/nshekhawat/portcullis/internal/ratelimiter"
 )
+
+// EnvPrefix is the environment variable prefix for all Portcullis settings.
+const EnvPrefix = "PORTCULLIS_"
+
+// legacyEnvPrefix is honored for one minor release after the rename from
+// rate-limiter-go. A deprecation warning is recorded for every legacy variable
+// that actually supplied a value.
+const legacyEnvPrefix = "RATE_LIMITER_"
+
+// warnLegacyEnvOnce ensures the process logs the rename deprecation at most once.
+var warnLegacyEnvOnce sync.Once
 
 // Config holds the complete application configuration.
 type Config struct {
@@ -18,6 +31,10 @@ type Config struct {
 	RateLimit RateLimitConfig `mapstructure:"ratelimit"`
 	Metrics   MetricsConfig   `mapstructure:"metrics"`
 	Logging   LoggingConfig   `mapstructure:"logging"`
+
+	// Deprecations names legacy environment variables that were honored while
+	// loading. Callers should surface these as warnings. Never set from config.
+	Deprecations []string `mapstructure:"-"`
 }
 
 // ServerConfig holds HTTP and gRPC server configuration.
@@ -87,7 +104,7 @@ func DefaultConfig() *Config {
 			MaxRetries:   3,
 		},
 		RateLimit: RateLimitConfig{
-			KeyPrefix:     "ratelimit:",
+			KeyPrefix:     "pc:",
 			EnableBypass:  false,
 			BypassHeaders: []string{},
 			DefaultRules: []ratelimiter.Rule{
@@ -115,6 +132,10 @@ func DefaultConfig() *Config {
 }
 
 // Load loads configuration from a file and environment variables.
+//
+// Environment variables use the PORTCULLIS_ prefix. Legacy RATE_LIMITER_*
+// variables are still honored for one minor release; when one is used it is
+// recorded in Config.Deprecations.
 func Load(configPath string) (*Config, error) {
 	v := viper.New()
 
@@ -129,7 +150,7 @@ func Load(configPath string) (*Config, error) {
 		v.SetConfigType("yaml")
 		v.AddConfigPath(".")
 		v.AddConfigPath("./configs")
-		v.AddConfigPath("/etc/rate-limiter")
+		v.AddConfigPath("/etc/portcullis")
 	}
 
 	// Read config file
@@ -140,16 +161,16 @@ func Load(configPath string) (*Config, error) {
 		// Config file not found, use defaults and env vars
 	}
 
-	// Configure environment variables
-	v.SetEnvPrefix("RATE_LIMITER")
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	v.AutomaticEnv()
+	// Bind environment variables for every known key, preferring the current
+	// prefix and falling back to the legacy one.
+	deprecations := bindEnv(v)
 
 	// Parse configuration
 	var config Config
 	if err := v.Unmarshal(&config); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
+	config.Deprecations = deprecations
 
 	// Validate configuration
 	if err := config.Validate(); err != nil {
@@ -157,6 +178,36 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	return &config, nil
+}
+
+// bindEnv binds each known configuration key to its current and legacy
+// environment variable names. A legacy name is only reported once the current
+// name is absent, i.e. when it actually supplied the value.
+func bindEnv(v *viper.Viper) []string {
+	var deprecations []string
+	for _, key := range v.AllKeys() {
+		suffix := strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
+		current := EnvPrefix + suffix
+		legacy := legacyEnvPrefix + suffix
+		if err := v.BindEnv(key, current, legacy); err != nil {
+			continue
+		}
+		if _, legacySet := os.LookupEnv(legacy); !legacySet {
+			continue
+		}
+		if _, currentSet := os.LookupEnv(current); currentSet {
+			continue
+		}
+		deprecations = append(deprecations, legacy)
+	}
+	return deprecations
+}
+
+// LogDeprecationOnce emits fn at most once per process for legacy env usage.
+// It exists so callers can funnel the rename warning through their logger
+// without config depending on a logging implementation.
+func LogDeprecationOnce(fn func()) {
+	warnLegacyEnvOnce.Do(fn)
 }
 
 // LoadFromViper loads configuration from an existing viper instance.
@@ -194,7 +245,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("redis.max_retries", 3)
 
 	// Rate limit defaults
-	v.SetDefault("ratelimit.key_prefix", "ratelimit:")
+	v.SetDefault("ratelimit.key_prefix", "pc:")
 	v.SetDefault("ratelimit.enable_bypass", false)
 	v.SetDefault("ratelimit.ttl", "1h")
 

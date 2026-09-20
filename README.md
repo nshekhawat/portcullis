@@ -26,7 +26,7 @@ A high-performance, distributed rate limiting service implementing the token buc
 
 ```bash
 # Clone the repository
-git clone https://github.com/nshekhawat/rate-limiter-go.git
+git clone https://github.com/nshekhawat/portcullis.git
 cd rate-limiter-go
 
 # Download dependencies
@@ -186,7 +186,7 @@ import (
     "context"
     "log"
 
-    "github.com/nshekhawat/rate-limiter-go/pkg/client"
+    "github.com/nshekhawat/portcullis/pkg/client"
 )
 
 func main() {
@@ -230,9 +230,9 @@ package main
 
 import (
     "github.com/gin-gonic/gin"
-    "github.com/nshekhawat/rate-limiter-go/internal/middleware"
-    "github.com/nshekhawat/rate-limiter-go/internal/ratelimiter"
-    "github.com/nshekhawat/rate-limiter-go/internal/storage"
+    "github.com/nshekhawat/portcullis/internal/middleware"
+    "github.com/nshekhawat/portcullis/internal/ratelimiter"
+    "github.com/nshekhawat/portcullis/internal/storage"
 )
 
 func main() {

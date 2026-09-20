@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/nshekhawat/rate-limiter-go/internal/storage"
+	"github.com/nshekhawat/portcullis/internal/storage"
 )
 
 // InstrumentedStorage wraps a storage backend with metrics collection.
