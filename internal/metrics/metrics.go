@@ -15,7 +15,10 @@ type Metrics struct {
 	RateLimitAllowed *prometheus.CounterVec
 	RateLimitDenied  *prometheus.CounterVec
 	TokensConsumed   *prometheus.CounterVec
-	TokensRemaining  *prometheus.GaugeVec
+
+	// RateLimitStorageFailures counts denied requests caused by the storage
+	// layer rather than by the caller's traffic. Labels carry no identity.
+	RateLimitStorageFailures *prometheus.CounterVec
 
 	// Storage metrics
 	StorageOperations     *prometheus.CounterVec
@@ -84,13 +87,13 @@ func NewMetrics(namespace string) *Metrics {
 			[]string{"identifier_type", "resource"},
 		),
 
-		TokensRemaining: promauto.NewGaugeVec(
-			prometheus.GaugeOpts{
+		RateLimitStorageFailures: promauto.NewCounterVec(
+			prometheus.CounterOpts{
 				Namespace: namespace,
-				Name:      "tokens_remaining",
-				Help:      "Current tokens remaining in buckets",
+				Name:      "ratelimit_storage_failures_total",
+				Help:      "Denied rate limit requests caused by the storage layer, by reason",
 			},
-			[]string{"identifier", "resource"},
+			[]string{"reason"},
 		),
 
 		StorageOperations: promauto.NewCounterVec(
@@ -165,11 +168,6 @@ func (m *Metrics) RecordRateLimitDecision(allowed bool, identifierType, resource
 	} else {
 		m.RateLimitDenied.WithLabelValues(identifierType, resource).Inc()
 	}
-}
-
-// RecordTokensRemaining records the current tokens remaining for an identifier.
-func (m *Metrics) RecordTokensRemaining(identifier, resource string, tokens float64) {
-	m.TokensRemaining.WithLabelValues(identifier, resource).Set(tokens)
 }
 
 // RecordStorageOperation records storage operation metrics.

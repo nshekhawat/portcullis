@@ -15,4 +15,9 @@ var (
 
 	// ErrInvalidState is returned when the stored state is invalid or corrupted.
 	ErrInvalidState = errors.New("invalid bucket state")
+
+	// ErrCapacity is returned when the backend cannot accept a new key because
+	// it is at its configured limit. Callers must treat it as a denial, never
+	// as permission to proceed (B5).
+	ErrCapacity = errors.New("storage capacity exceeded")
 )

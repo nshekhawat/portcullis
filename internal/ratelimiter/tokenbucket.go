@@ -3,98 +3,103 @@ package ratelimiter
 import (
 	"sync"
 	"time"
+
+	"github.com/nshekhawat/portcullis/internal/bucket"
+	"github.com/nshekhawat/portcullis/internal/clock"
 )
 
-// TokenBucket implements the token bucket algorithm for rate limiting.
-// It is thread-safe and uses lazy refill to calculate tokens on-demand.
+// TokenBucket implements the token bucket algorithm with lazy refill.
+//
+// Storage backends own their own buckets; this type is a convenience wrapper
+// over the pure Refill function for callers that want an isolated in-process
+// limiter and for the benchmark suite (B23). It is safe for concurrent use.
 type TokenBucket struct {
-	capacity       int64     // Maximum number of tokens
-	tokens         float64   // Current available tokens (float for precise refill calculations)
-	refillRate     float64   // Tokens added per second
-	lastRefillTime time.Time // Timestamp of last refill calculation
-	mu             sync.Mutex
+	mu         sync.Mutex
+	capacity   int64
+	refillRate float64 // tokens per second
+	tokens     float64
+	lastRefill time.Time
+	clock      clock.Clock
 }
 
-// NewTokenBucket creates a new token bucket with the specified capacity and refill rate.
-// The bucket starts full (tokens = capacity).
+// NewTokenBucket creates a bucket that starts full.
+// refillRate is expressed in tokens per second.
 func NewTokenBucket(capacity int64, refillRate float64) *TokenBucket {
+	return NewTokenBucketWithClock(capacity, refillRate, clock.System())
+}
+
+// NewTokenBucketWithClock creates a bucket driven by the supplied clock.
+func NewTokenBucketWithClock(capacity int64, refillRate float64, clk clock.Clock) *TokenBucket {
+	if clk == nil {
+		clk = clock.System()
+	}
+	tokens := float64(capacity)
+	if tokens < 0 {
+		tokens = 0
+	}
 	return &TokenBucket{
-		capacity:       capacity,
-		tokens:         float64(capacity),
-		refillRate:     refillRate,
-		lastRefillTime: time.Now(),
+		capacity:   capacity,
+		refillRate: refillRate,
+		tokens:     tokens,
+		lastRefill: clk.Now(),
+		clock:      clk,
 	}
 }
 
-// Allow checks if a single token can be consumed.
-// Returns true if the request is allowed (token consumed), false otherwise.
+// Allow reports whether a single token can be consumed.
 func (tb *TokenBucket) Allow() bool {
 	return tb.AllowN(1)
 }
 
-// AllowN checks if n tokens can be consumed.
-// Returns true if the request is allowed (tokens consumed), false otherwise.
+// AllowN reports whether n tokens can be consumed. Tokens are only consumed
+// when the request succeeds. A request for zero or fewer tokens always
+// succeeds and consumes nothing.
 func (tb *TokenBucket) AllowN(n int64) bool {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
-	tb.refill()
+	tb.refillLocked()
 
-	if tb.tokens >= float64(n) {
-		tb.tokens -= float64(n)
+	if n <= 0 {
 		return true
 	}
-	return false
-}
-
-// refill calculates and adds tokens based on elapsed time since last refill.
-// This implements lazy refill - tokens are calculated on-demand rather than
-// using background goroutines.
-// Must be called with mu held.
-func (tb *TokenBucket) refill() {
-	now := time.Now()
-	elapsed := now.Sub(tb.lastRefillTime).Seconds()
-
-	if elapsed > 0 {
-		// Calculate tokens to add based on elapsed time
-		tokensToAdd := elapsed * tb.refillRate
-
-		// Add tokens, but don't exceed capacity
-		tb.tokens += tokensToAdd
-		if tb.tokens > float64(tb.capacity) {
-			tb.tokens = float64(tb.capacity)
-		}
-
-		tb.lastRefillTime = now
+	if tb.tokens < float64(n) {
+		return false
 	}
+	tb.tokens -= float64(n)
+	return true
 }
 
-// Reset resets the bucket to full capacity.
+// refillLocked applies accrued tokens. Must be called with mu held.
+func (tb *TokenBucket) refillLocked() {
+	s := bucket.Refill(bucket.State{Tokens: tb.tokens, LastRefill: tb.lastRefill}, tb.capacity, tb.refillRate, tb.clock.Now())
+	tb.tokens = s.Tokens
+	tb.lastRefill = s.LastRefill
+}
+
+// Reset returns the bucket to full capacity.
 func (tb *TokenBucket) Reset() {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
 	tb.tokens = float64(tb.capacity)
-	tb.lastRefillTime = time.Now()
+	if tb.tokens < 0 {
+		tb.tokens = 0
+	}
+	tb.lastRefill = tb.clock.Now()
 }
 
-// GetAvailableTokens returns the current number of available tokens.
-// This also triggers a refill calculation.
+// GetAvailableTokens returns the whole number of available tokens, after refill.
 func (tb *TokenBucket) GetAvailableTokens() int64 {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-
-	tb.refill()
-	return int64(tb.tokens)
+	return int64(tb.GetAvailableTokensFloat())
 }
 
-// GetAvailableTokensFloat returns the current number of available tokens as a float.
-// This also triggers a refill calculation.
+// GetAvailableTokensFloat returns the available tokens as a float, after refill.
 func (tb *TokenBucket) GetAvailableTokensFloat() float64 {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
-	tb.refill()
+	tb.refillLocked()
 	return tb.tokens
 }
 
@@ -103,36 +108,35 @@ func (tb *TokenBucket) GetCapacity() int64 {
 	return tb.capacity
 }
 
-// GetRefillRate returns the bucket's refill rate (tokens per second).
+// GetRefillRate returns the bucket's refill rate in tokens per second.
 func (tb *TokenBucket) GetRefillRate() float64 {
 	return tb.refillRate
 }
 
-// TimeUntilTokens returns the duration until n tokens will be available.
-// Returns 0 if n tokens are already available.
+// TimeUntilTokens returns how long until n tokens are available. It returns 0
+// when they already are, and 0 when the bucket can never accumulate them.
 func (tb *TokenBucket) TimeUntilTokens(n int64) time.Duration {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
-	tb.refill()
+	tb.refillLocked()
 
 	if tb.tokens >= float64(n) {
 		return 0
 	}
-
-	// Calculate time needed to accumulate required tokens
-	tokensNeeded := float64(n) - tb.tokens
-	secondsNeeded := tokensNeeded / tb.refillRate
-
-	return time.Duration(secondsNeeded * float64(time.Second))
+	if tb.refillRate <= 0 {
+		return 0
+	}
+	seconds := (float64(n) - tb.tokens) / tb.refillRate
+	return time.Duration(seconds * float64(time.Second))
 }
 
-// BucketSnapshot represents a point-in-time snapshot of a token bucket's state.
+// BucketSnapshot is a point-in-time view of a token bucket.
 type BucketSnapshot struct {
-	Capacity       int64
 	Tokens         float64
-	RefillRate     float64
 	LastRefillTime time.Time
+	Capacity       int64
+	RefillRate     float64
 }
 
 // GetState returns a snapshot of the current bucket state.
@@ -140,28 +144,26 @@ func (tb *TokenBucket) GetState() BucketSnapshot {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
-	tb.refill()
-
+	tb.refillLocked()
 	return BucketSnapshot{
-		Capacity:       tb.capacity,
 		Tokens:         tb.tokens,
+		LastRefillTime: tb.lastRefill,
+		Capacity:       tb.capacity,
 		RefillRate:     tb.refillRate,
-		LastRefillTime: tb.lastRefillTime,
 	}
 }
 
-// SetState restores the bucket to a previous state.
-// This is useful for distributed scenarios where state is loaded from storage.
+// SetState restores the bucket to a previously captured state.
 func (tb *TokenBucket) SetState(tokens float64, lastRefillTime time.Time) {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
+	if tokens < 0 {
+		tokens = 0
+	}
+	if tokens > float64(tb.capacity) {
+		tokens = float64(tb.capacity)
+	}
 	tb.tokens = tokens
-	if tb.tokens > float64(tb.capacity) {
-		tb.tokens = float64(tb.capacity)
-	}
-	if tb.tokens < 0 {
-		tb.tokens = 0
-	}
-	tb.lastRefillTime = lastRefillTime
+	tb.lastRefill = lastRefillTime
 }

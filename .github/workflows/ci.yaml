@@ -101,6 +101,14 @@ jobs:
       - name: Compile and run benchmarks briefly
         run: go test -run '^$' -bench . -benchtime 100x ./internal/...
 
+  manifests:
+    name: Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Render kustomization
+        run: kubectl kustomize k8s/ > /dev/null
+
   docker:
     name: Docker build
     runs-on: ubuntu-latest

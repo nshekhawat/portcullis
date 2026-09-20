@@ -1,12 +1,50 @@
-# Rate Limiter Configuration Example
-# Copy this file to config.yaml and modify as needed
+# Portcullis configuration example.
+#
+# Every setting can also be supplied through the environment with the
+# PORTCULLIS_ prefix, e.g. PORTCULLIS_SERVER_HTTP_PORT=8080.
+# The legacy RATE_LIMITER_ prefix still works for one release and logs a
+# deprecation warning.
 
 server:
   http_port: 8080
   grpc_port: 9090
+
+  # HTTP timeouts. read_header_timeout and max_header_bytes bound slowloris
+  # exposure; max_body_bytes caps JSON request bodies.
   read_timeout: 10s
+  read_header_timeout: 5s
   write_timeout: 10s
+  idle_timeout: 60s
   shutdown_timeout: 30s
+  max_header_bytes: 65536
+  max_body_bytes: 8192
+
+  # CIDRs whose X-Forwarded-For headers are believed. Empty trusts nobody and
+  # uses the peer address, which is the safe default.
+  trusted_proxies: []
+
+  # Browser origins allowed on public routes, e.g. ["https://app.example.com"].
+  # Empty emits no CORS headers; admin routes never receive them.
+  cors_origins: []
+
+  # gRPC server reflection. Off by default; it exposes the API surface.
+  grpc_reflection: false
+
+admin:
+  # Environment variable holding comma-separated bearer tokens for /v1/admin
+  # and the admin gRPC RPCs. Tokens never live in this file.
+  tokens_env: PORTCULLIS_ADMIN_TOKENS
+
+storage:
+  # memory | redis
+  backend: memory
+  # What to do when the storage layer fails on the request path:
+  # deny (fail closed, default) | allow
+  on_storage_error: deny
+
+memory:
+  cleanup_interval: 1m
+  max_keys: 1000000
 
 redis:
   address: "localhost:6379"
@@ -17,38 +55,31 @@ redis:
   dial_timeout: 5s
   read_timeout: 3s
   write_timeout: 3s
-  max_retries: 3
 
 ratelimit:
-  key_prefix: "ratelimit:"
-  enable_bypass: false
-  bypass_headers:
-    - "X-Bypass-RateLimit"
-  default_rules:
-    - name: "default"
-      capacity: 100
-      refill_rate: 10.0
-      period: 1m
-      burst_size: 20
-  custom_rules:
-    api_heavy:
-      name: "api_heavy"
-      capacity: 10
-      refill_rate: 1.0
-      period: 1m
-      burst_size: 5
-    api_light:
-      name: "api_light"
-      capacity: 1000
-      refill_rate: 100.0
-      period: 1m
-      burst_size: 200
+  key_prefix: "pc:"
+  ttl: 1h
+
+  # refill_rate is tokens per period, so this rule allows 100 requests per
+  # minute with a burst of 100. capacity is the burst.
+  default_rule: { name: default, capacity: 100, refill_rate: 100, period: 1m }
+
+  # Named rules, selected by resource. Lookup is case-insensitive.
+  rules:
+    login: { capacity: 10, refill_rate: 10, period: 1m }
+
+  # Secret-gated bypass. Without a secret in the environment the bypass header
+  # is ignored entirely.
+  bypass:
+    enabled: false
+    header: X-Portcullis-Bypass
+    secrets_env: PORTCULLIS_BYPASS_SECRETS
 
 metrics:
   enabled: true
-  path: "/metrics"
+  path: /metrics
 
 logging:
-  level: "info"
-  format: "json"
-  output: "stdout"
+  level: info    # debug, info, warn, error
+  format: json   # json, console, text
+  output: stdout

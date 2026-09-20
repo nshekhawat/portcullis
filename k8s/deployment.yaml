@@ -21,7 +21,7 @@ spec:
       serviceAccountName: portcullis
       containers:
         - name: portcullis
-          image: portcullis:latest
+          image: portcullis:0.1.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -33,8 +33,17 @@ spec:
           env:
             - name: CONFIG_PATH
               value: "/config/config.yaml"
-            - name: PORTCULLIS_USE_REDIS
-              value: "true"
+            - name: PORTCULLIS_ADMIN_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: portcullis-admin-tokens
+                  key: tokens
+            - name: PORTCULLIS_BYPASS_SECRETS
+              valueFrom:
+                secretKeyRef:
+                  name: portcullis-admin-tokens
+                  key: bypass-secrets
+                  optional: true
           volumeMounts:
             - name: config
               mountPath: /config

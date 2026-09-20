@@ -2,6 +2,8 @@ package ratelimiter
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,7 +27,7 @@ func newTestRateLimiter(t *testing.T) (*RateLimiter, func()) {
 			RefillRate: 1.0,
 			Period:     time.Minute,
 		},
-		CustomRules: map[string]*Rule{
+		Rules: map[string]*Rule{
 			"api_heavy": {
 				Name:       "api_heavy",
 				Capacity:   5,
@@ -386,95 +388,203 @@ func TestRateLimiter_ZeroRefillRate(t *testing.T) {
 	assert.Equal(t, time.Duration(0), decision.RetryAfter) // No retry after with zero refill
 }
 
-// Test helper functions
-
-func TestExtractIPFromRequest(t *testing.T) {
+// TestRule_RefillPerPeriod covers B8: refill_rate is expressed per period.
+func TestRule_RefillPerPeriod(t *testing.T) {
 	tests := []struct {
-		name          string
-		xForwardedFor string
-		remoteAddr    string
-		expectedIP    string
+		name string
+		rule Rule
+		want float64
 	}{
 		{
-			name:          "X-Forwarded-For with single IP",
-			xForwardedFor: "192.168.1.1",
-			remoteAddr:    "10.0.0.1:8080",
-			expectedIP:    "192.168.1.1",
+			name: "ten per minute is one sixth per second",
+			rule: Rule{Capacity: 100, RefillRate: 10, Period: time.Minute},
+			want: 10.0 / 60.0,
 		},
 		{
-			name:          "X-Forwarded-For with multiple IPs",
-			xForwardedFor: "192.168.1.1, 10.0.0.2, 10.0.0.3",
-			remoteAddr:    "10.0.0.1:8080",
-			expectedIP:    "192.168.1.1",
+			name: "ten per second is ten per second",
+			rule: Rule{Capacity: 100, RefillRate: 10, Period: time.Second},
+			want: 10,
 		},
 		{
-			name:          "Empty X-Forwarded-For, use RemoteAddr",
-			xForwardedFor: "",
-			remoteAddr:    "10.0.0.1:8080",
-			expectedIP:    "10.0.0.1",
-		},
-		{
-			name:          "RemoteAddr without port",
-			xForwardedFor: "",
-			remoteAddr:    "10.0.0.1",
-			expectedIP:    "10.0.0.1",
-		},
-		{
-			name:          "Both empty",
-			xForwardedFor: "",
-			remoteAddr:    "",
-			expectedIP:    "unknown",
-		},
-		{
-			name:          "IPv6 in X-Forwarded-For",
-			xForwardedFor: "::1",
-			remoteAddr:    "",
-			expectedIP:    "::1",
+			name: "missing period defaults to one second",
+			rule: Rule{Capacity: 10, RefillRate: 5},
+			want: 5,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ip := ExtractIPFromRequest(tt.xForwardedFor, tt.remoteAddr)
-			assert.Equal(t, tt.expectedIP, ip)
+			assert.InDelta(t, tt.want, tt.rule.RatePerSecond(), 1e-9)
 		})
 	}
 }
 
-func TestBuildCompositeKey(t *testing.T) {
-	tests := []struct {
-		name     string
-		parts    []string
-		expected string
-	}{
-		{
-			name:     "Single part",
-			parts:    []string{"user123"},
-			expected: "user123",
-		},
-		{
-			name:     "Multiple parts",
-			parts:    []string{"user123", "api", "endpoint"},
-			expected: "user123:api:endpoint",
-		},
-		{
-			name:     "With empty parts",
-			parts:    []string{"user123", "", "endpoint"},
-			expected: "user123:endpoint",
-		},
-		{
-			name:     "All empty",
-			parts:    []string{"", "", ""},
-			expected: "",
-		},
-	}
+func TestRule_Normalize(t *testing.T) {
+	rule := Rule{Capacity: 1, RefillRate: 1}
+	rule.Normalize()
+	assert.Equal(t, time.Second, rule.Period)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			key := BuildCompositeKey(tt.parts...)
-			assert.Equal(t, tt.expected, key)
-		})
+	rule = Rule{Capacity: 1, RefillRate: 1, Period: time.Minute}
+	rule.Normalize()
+	assert.Equal(t, time.Minute, rule.Period)
+}
+
+// TestKey_NoCollision covers B20: the composite separator cannot be forged by
+// an identifier that contains a colon.
+func TestKey_NoCollision(t *testing.T) {
+	assert.NotEqual(t, BuildCompositeKey("a:b", ""), BuildCompositeKey("a", "b"))
+	assert.NotEqual(t, BuildCompositeKey("a", "b:c"), BuildCompositeKey("a:b", "c"))
+
+	assert.Equal(t, "x"+KeySeparator+"y", BuildCompositeKey("x", "y"))
+	assert.Equal(t, "x", BuildCompositeKey("x", ""))
+	assert.Equal(t, "", BuildCompositeKey("", "", ""))
+}
+
+func TestRateLimiter_TokensAboveCapacityRejected(t *testing.T) {
+	rl, cleanup := newTestRateLimiter(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// The default rule has capacity 10.
+	_, err := rl.AllowN(ctx, "user1", "", 11)
+	require.ErrorIs(t, err, ErrInvalidTokens)
+
+	_, err = rl.AllowN(ctx, "user1", "", 0)
+	require.ErrorIs(t, err, ErrInvalidTokens)
+
+	decision, err := rl.AllowN(ctx, "user1", "", 10)
+	require.NoError(t, err)
+	assert.True(t, decision.Allowed)
+}
+
+func TestRateLimiter_KeysTooLongRejected(t *testing.T) {
+	rl, cleanup := newTestRateLimiter(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	_, err := rl.AllowN(ctx, strings.Repeat("a", MaxIdentifierLength+1), "", 1)
+	require.ErrorIs(t, err, ErrInvalidIdentifier)
+
+	_, err = rl.AllowN(ctx, "user1", strings.Repeat("r", MaxResourceLength+1), 1)
+	require.ErrorIs(t, err, ErrInvalidResource)
+}
+
+// TestRateLimiter_RuleChangeAppliesImmediately covers B11 in memory mode.
+func TestRateLimiter_RuleChangeAppliesImmediately(t *testing.T) {
+	store := storage.NewMemoryStorage(time.Minute)
+	defer store.Close()
+
+	ctx := context.Background()
+	config := &Config{
+		KeyPrefix: "test:",
+		DefaultRule: &Rule{
+			Name:       "default",
+			Capacity:   100,
+			RefillRate: 100,
+			Period:     time.Second,
+		},
+		TTL: time.Hour,
 	}
+	rl := NewRateLimiter(store, config, nil)
+
+	// Consume down to 10 remaining with the big bucket.
+	decision, err := rl.AllowN(ctx, "user1", "", 90)
+	require.NoError(t, err)
+	require.True(t, decision.Allowed)
+
+	// Shrink the rule. Tokens clamp to the new capacity of 5, so the next
+	// request for 5 succeeds and a second one does not.
+	config.DefaultRule = &Rule{Name: "default", Capacity: 5, RefillRate: 5, Period: time.Minute}
+
+	info, err := rl.GetLimitInfo(ctx, "user1", "")
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), info.Limit)
+	assert.InDelta(t, 5.0, info.TokensAvailable, 0.5)
+
+	decision, err = rl.AllowN(ctx, "user1", "", 5)
+	require.NoError(t, err)
+	assert.True(t, decision.Allowed)
+
+	decision, err = rl.AllowN(ctx, "user1", "", 5)
+	require.NoError(t, err)
+	assert.False(t, decision.Allowed)
+}
+
+// TestRateLimiter_StorageErrorPolicy covers the fail-closed default.
+func TestRateLimiter_StorageErrorPolicy(t *testing.T) {
+	ctx := context.Background()
+	boom := errors.New("storage down")
+
+	t.Run("deny by default", func(t *testing.T) {
+		rl := NewRateLimiter(&failingStorage{err: boom}, &Config{
+			KeyPrefix:   "test:",
+			DefaultRule: &Rule{Capacity: 10, RefillRate: 10, Period: time.Second},
+		}, nil)
+
+		decision, err := rl.Allow(ctx, "user1")
+		require.NoError(t, err)
+		assert.False(t, decision.Allowed)
+		assert.Equal(t, ReasonStorageError, decision.Reason)
+	})
+
+	t.Run("allow when configured", func(t *testing.T) {
+		rl := NewRateLimiter(&failingStorage{err: boom}, &Config{
+			KeyPrefix:      "test:",
+			DefaultRule:    &Rule{Capacity: 10, RefillRate: 10, Period: time.Second},
+			OnStorageError: "allow",
+		}, nil)
+
+		decision, err := rl.Allow(ctx, "user1")
+		require.NoError(t, err)
+		assert.True(t, decision.Allowed)
+	})
+
+	t.Run("capacity error always denies", func(t *testing.T) {
+		rl := NewRateLimiter(&failingStorage{err: storage.ErrCapacity}, &Config{
+			KeyPrefix:      "test:",
+			DefaultRule:    &Rule{Capacity: 10, RefillRate: 10, Period: time.Second},
+			OnStorageError: "allow",
+		}, nil)
+
+		decision, err := rl.Allow(ctx, "user1")
+		require.NoError(t, err)
+		assert.False(t, decision.Allowed)
+		assert.Equal(t, ReasonCapacity, decision.Reason)
+	})
+}
+
+func TestRetryAfterSeconds(t *testing.T) {
+	tests := []struct {
+		in   time.Duration
+		want int64
+	}{
+		{0, 1},
+		{time.Nanosecond, 1},
+		{time.Second, 1},
+		{1500 * time.Millisecond, 2},
+		{2 * time.Second, 2},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, RetryAfterSeconds(tt.in), tt.in.String())
+	}
+}
+
+// failingStorage is a storage stub that always fails, for error-policy tests.
+type failingStorage struct{ err error }
+
+func (f *failingStorage) Get(context.Context, string) (*storage.BucketState, error) {
+	return nil, f.err
+}
+func (f *failingStorage) Set(context.Context, string, *storage.BucketState, time.Duration) error {
+	return f.err
+}
+func (f *failingStorage) Delete(context.Context, string) error { return f.err }
+func (f *failingStorage) Close() error                         { return nil }
+func (f *failingStorage) Ping(context.Context) error           { return f.err }
+func (f *failingStorage) CheckAndConsume(context.Context, string, int64, int64, float64, time.Duration) (*storage.ConsumeResult, error) {
+	return nil, f.err
 }
 
 // Benchmarks

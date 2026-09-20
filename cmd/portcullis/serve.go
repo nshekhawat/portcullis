@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 	"github.com/nshekhawat/portcullis/internal/config"
 	"github.com/nshekhawat/portcullis/internal/metrics"
+	"github.com/nshekhawat/portcullis/internal/netx"
 	"github.com/nshekhawat/portcullis/internal/ratelimiter"
 	"github.com/nshekhawat/portcullis/internal/server"
 	"github.com/nshekhawat/portcullis/internal/storage"
@@ -44,9 +46,7 @@ func runServe(args []string) error {
 
 	config.LogDeprecationOnce(func() {
 		for _, name := range cfg.Deprecations {
-			logger.Warn("deprecated environment variable used; switch to the PORTCULLIS_ prefix",
-				zap.String("legacy", name),
-			)
+			logger.Warn("deprecated setting in use", zap.String("setting", name))
 		}
 	})
 
@@ -58,23 +58,41 @@ func runServe(args []string) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := store.Ping(ctx); err != nil {
-		return fmt.Errorf("storage ping failed: %w", err)
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelPing()
+	if pingErr := store.Ping(pingCtx); pingErr != nil {
+		return fmt.Errorf("storage ping failed: %w", pingErr)
 	}
 	logger.Info("storage connected successfully")
 
-	limiter := ratelimiter.NewRateLimiter(store, cfg.ToRateLimiterConfig(), logger)
+	trustedProxies, err := netx.ParsePrefixes(cfg.Server.TrustedProxies)
+	if err != nil {
+		return fmt.Errorf("invalid server.trusted_proxies: %w", err)
+	}
+
+	limiterConfig := cfg.ToRateLimiterConfig()
+	limiterConfig.OnStorageError = cfg.Storage.OnStorageError
+	limiterConfig.Observer = metrics.NewDecisionRecorder(metrics.DefaultMetrics, ruleNames(cfg)...)
+
+	limiter := ratelimiter.NewRateLimiter(store, limiterConfig, logger)
 
 	errCh := make(chan error, 2)
 
-	httpServer := server.NewHTTPServer(limiter, &server.HTTPConfig{
-		Port:           cfg.Server.HTTPPort,
-		ReadTimeout:    cfg.Server.ReadTimeout,
-		WriteTimeout:   cfg.Server.WriteTimeout,
-		MetricsEnabled: cfg.Metrics.Enabled,
-		MetricsPath:    cfg.Metrics.Path,
+	httpServer := server.NewHTTPServer(limiter, store, &server.HTTPConfig{
+		Port:              cfg.Server.HTTPPort,
+		ReadTimeout:       cfg.Server.ReadTimeout,
+		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout,
+		WriteTimeout:      cfg.Server.WriteTimeout,
+		IdleTimeout:       cfg.Server.IdleTimeout,
+		ShutdownTimeout:   cfg.Server.ShutdownTimeout,
+		MaxHeaderBytes:    cfg.Server.MaxHeaderBytes,
+		MaxBodyBytes:      cfg.Server.MaxBodyBytes,
+		MetricsPath:       cfg.Metrics.Path,
+		MetricsEnabled:    cfg.Metrics.Enabled,
+		TrustedProxies:    trustedProxies,
+		AdminTokens:       cfg.Admin.Tokens(),
+		CORSOrigins:       cfg.Server.CORSOrigins,
+		Metrics:           metrics.DefaultMetrics,
 	}, logger)
 
 	go func() {
@@ -87,8 +105,10 @@ func runServe(args []string) error {
 		Port:              cfg.Server.GRPCPort,
 		MaxRecvMsgSize:    4 * 1024 * 1024,
 		MaxSendMsgSize:    4 * 1024 * 1024,
-		EnableReflection:  true,
+		EnableReflection:  cfg.Server.GRPCReflection,
 		EnableHealthCheck: true,
+		AdminTokens:       cfg.Admin.Tokens(),
+		Metrics:           metrics.DefaultMetrics,
 	}, logger)
 
 	go func() {
@@ -109,7 +129,7 @@ func runServe(args []string) error {
 
 	logger.Info("shutting down servers...")
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer shutdownCancel()
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
@@ -120,6 +140,20 @@ func runServe(args []string) error {
 
 	logger.Info("servers stopped successfully")
 	return nil
+}
+
+// ruleNames returns the configured rule names for the metrics allowlist,
+// sorted for determinism.
+func ruleNames(cfg *config.Config) []string {
+	names := make([]string, 0, len(cfg.RateLimit.Rules)+1)
+	if name := cfg.RateLimit.DefaultRule.Name; name != "" {
+		names = append(names, name)
+	}
+	for name := range cfg.RateLimit.Rules {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func initLogger(cfg config.LoggingConfig) (*zap.Logger, error) {
@@ -144,12 +178,20 @@ func initLogger(cfg config.LoggingConfig) (*zap.Logger, error) {
 	return zapConfig.Build()
 }
 
+// initStorage builds the configured backend. The backend is chosen by
+// storage.backend; the pre-rename PORTCULLIS_USE_REDIS variable still works
+// for one release (B17).
 func initStorage(cfg *config.Config, logger *zap.Logger) (storage.AtomicStorage, error) {
-	useRedis := os.Getenv("PORTCULLIS_USE_REDIS") == "true" || os.Getenv("RATE_LIMITER_USE_REDIS") == "true"
+	backend := cfg.Storage.Backend
+	if useRedisEnv() {
+		logger.Warn("PORTCULLIS_USE_REDIS is deprecated; set storage.backend: redis instead")
+		backend = config.BackendRedis
+	}
 
-	if useRedis {
+	switch backend {
+	case config.BackendRedis:
 		logger.Info("initializing Redis storage", zap.String("address", cfg.Redis.Address))
-		redisConfig := &storage.RedisConfig{
+		store, err := storage.NewRedisStorage(&storage.RedisConfig{
 			Address:      cfg.Redis.Address,
 			Password:     cfg.Redis.Password,
 			DB:           cfg.Redis.DB,
@@ -158,16 +200,29 @@ func initStorage(cfg *config.Config, logger *zap.Logger) (storage.AtomicStorage,
 			DialTimeout:  cfg.Redis.DialTimeout,
 			ReadTimeout:  cfg.Redis.ReadTimeout,
 			WriteTimeout: cfg.Redis.WriteTimeout,
-			MaxRetries:   cfg.Redis.MaxRetries,
-		}
-		store, err := storage.NewRedisStorage(redisConfig)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Redis storage: %w", err)
 		}
 		return metrics.NewInstrumentedAtomicStorage(store, "redis", nil), nil
-	}
 
-	logger.Info("initializing memory storage")
-	store := storage.NewMemoryStorage(cfg.RateLimit.TTL)
-	return metrics.NewInstrumentedAtomicStorage(store, "memory", nil), nil
+	case config.BackendMemory:
+		logger.Info("initializing memory storage",
+			zap.Duration("cleanup_interval", cfg.Memory.CleanupInterval),
+			zap.Int("max_keys", cfg.Memory.MaxKeys),
+		)
+		store := storage.NewMemoryStorageWithOptions(storage.MemoryOptions{
+			CleanupInterval: cfg.Memory.CleanupInterval,
+			MaxKeys:         cfg.Memory.MaxKeys,
+		})
+		return metrics.NewInstrumentedAtomicStorage(store, "memory", nil), nil
+
+	default:
+		return nil, fmt.Errorf("unsupported storage backend %q", backend)
+	}
+}
+
+// useRedisEnv reports whether the legacy Redis toggle is set.
+func useRedisEnv() bool {
+	return os.Getenv(config.EnvPrefix+"USE_REDIS") == "true" || os.Getenv("RATE_LIMITER_USE_REDIS") == "true"
 }
