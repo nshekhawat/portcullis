@@ -93,10 +93,18 @@ increments, and the data plane is unaffected.
 
 `judge_requests_total{outcome="budget_skipped"}` rises and cycles stop judging.
 
-- Raise `judgment.budget.max_calls_per_minute` only after checking
-  `judge_suspects_per_call`: a large number means detection is over-selecting,
-  which is a detection-tuning problem, not a budget problem.
-- Raise `detection.min_score` to select fewer suspects.
+Two separate limits produce this outcome, and they need different responses:
+
+- **Calls per minute.** Raise `judgment.budget.max_calls_per_minute` only after
+  checking `judge_suspects_per_call`: a large number means detection is
+  over-selecting, which is a detection-tuning problem, not a budget problem.
+  Raise `detection.min_score` to select fewer suspects.
+- **Input tokens per day.** Compare `judge_input_tokens_total` against
+  `judgment.budget.max_input_tokens_per_day`. Once the daily cap is reached no
+  further calls are made until midnight UTC, so tiers stop being updated and
+  existing ones expire on their TTLs — the fail-static path, not an outage.
+  Only judges that report usage are charged; the offline `rules` judge always
+  reports zero.
 
 ### Blast-radius guardrail tripped
 
@@ -118,6 +126,13 @@ by a full resync every 10 s. If a replica shows tiers that others do not:
 3. If it does not, check the replica can reach Redis and subscribe to
    `pc:tiers:events`; a blocked pub/sub connection still leaves the resync as a
    safety net.
+
+Expired entries do not accumulate. The memory store prunes on a one-minute
+ticker; the Redis store reaps expired fields from `pc:tiers` during the reads
+it already does, deleting a field only while it still holds the value that
+read saw, so an identity re-escalated by another replica mid-sweep keeps its
+fresh entry. Neither store reports expired entries from `List`, so
+`portcullis admin tiers` shows only what is actually in force.
 
 ### Clearing all tiers
 
@@ -148,6 +163,8 @@ that as the system of record.
 | `portcullis_guardrail_trips_total{guardrail="G5_blast_radius"}` | an escalation storm was stopped |
 | `histogram_quantile(0.99, rate(portcullis_http_request_duration_seconds_bucket[5m]))` | the data plane's latency budget |
 | `portcullis_tracked_identities` near `signals.max_identities` | eviction is about to start dropping the least active identities |
+| `portcullis_judge_input_tokens_total` against `max_input_tokens_per_day` | the daily cap stops judging outright once reached |
+| `portcullis_tier_denials_total{tier="block"}` | traffic being refused outright, before storage is touched |
 
 ## Configuration notes that bite
 
@@ -163,3 +180,22 @@ that as the system of record.
   request is rejected (fail-closed).
 - **`memory.max_keys`** is a safety valve against key churn, not a tuning knob;
   if you reach it, find out why keys are unbounded.
+
+### Configuration that refuses to start
+
+These fail at startup rather than degrading quietly, because each one would
+otherwise change what the deployment enforces while it still reported healthy.
+
+- **`judgment.judge: typesafe` without an API key.** The variable named by
+  `judgment.typesafe.api_key_env` must be set and non-empty. There is no
+  automatic fallback to the `rules` judge: `judgment.policy` thresholds are
+  tuned against the pinned model, so running them against the offline judge
+  changes the reachable tiers. To run offline, set `judge: rules` explicitly.
+  The same applies to `fallback_judge: typesafe`; leave `fallback_judge` empty
+  if you want no fallback.
+- **`judgment.policy` lists out of order.** Each label's rules must descend by
+  `min_confidence`, because the first rule a verdict clears is the one that
+  applies. An ascending list would silently match the loosest rule forever.
+- **A malformed CIDR in `judgment.guardrails.allowlist`.** Entries containing
+  `/` must parse as a prefix. Non-address entries (API keys, service names)
+  are still accepted as exact-match identities.

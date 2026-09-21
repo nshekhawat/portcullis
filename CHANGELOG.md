@@ -73,6 +73,39 @@ Read this section before upgrading.
   not idempotent, so a retried `EVALSHA` could consume tokens twice. Requires
   Redis 7 or newer for effects replication and server-side `TIME` (B12).
 
+The following come from the post-implementation review in
+`docs/REVIEW-GAPS.md`, whose findings are numbered H1–H3, M1–M7 and L1–L9.
+
+- **A configured judge that cannot be built fails startup (M6).** With
+  `judgment.judge: typesafe` (or `fallback_judge: typesafe`) and no API key in
+  the configured `api_key_env`, the process used to log a warning and run the
+  rules judge instead. It now refuses to start. `judgment.policy` thresholds
+  are tuned against the pinned model, so the silent substitution ran tuned
+  thresholds against an untuned judge while reporting healthy. Configure
+  `judge: rules` explicitly to run offline.
+- **`judgment.policy` lists must be in descending `min_confidence` order
+  (M5).** `PolicyFor` returns the first rule a verdict clears, so an ascending
+  list silently matched the loosest rule and never reached the stricter one
+  behind it. Validation now rejects it, naming the label and the offending
+  pair, instead of under-enforcing quietly.
+- **A malformed CIDR in `judgment.guardrails.allowlist` fails startup (L4).**
+  An entry containing `/` that does not parse used to become an
+  exact-identity match — a string no real identity can equal, so a permanent
+  silent no-op on the "never escalated" list.
+- **`portcullis_tier_denials_total` counts every tier's denials (H3).** The
+  limiter never populated the tier on the decision it handed to the metrics
+  observer, so every denial was labeled `tier="normal"`. It now carries the
+  real tier, and a throttle- or strict-tier identity whose scaled bucket runs
+  dry is attributed to that tier rather than only outright `block` refusals.
+  Storage-failure denials stay out of the series: they are not attributable to
+  a tier. Dashboards and alerts that filtered on `tier="normal"` or assumed
+  block-only semantics need updating.
+- **Expired tier entries are no longer returned by the Redis tier store
+  (H2).** `TierStore.List` documents "every active entry" and the memory
+  backend already filtered; the Redis backend returned expired entries too, so
+  `GET /v1/admin/tiers` and the blast-radius population counted tiers that had
+  already lapsed.
+
 ### Added
 
 - **Signals plane** (`internal/signals`): a sharded observation aggregator with
@@ -144,6 +177,16 @@ Read this section before upgrading.
 - Readiness probes storage with `Ping` instead of looking up a fake key (B19).
 - `Retry-After` never reports `0` for a sub-second wait (B10).
 - Client-supplied `X-Request-ID` values are validated before being echoed (B21).
+- The judgment controller keeps ticking in `mode: off`, so flipping the mode
+  through `PUT /v1/admin/config/mode` takes effect without a restart (M4).
+- Expired tier entries are swept rather than accumulating: the memory store
+  prunes on a one-minute ticker and the Redis store reaps fields during the
+  reads it already performs, using a compare-and-delete script so a
+  concurrently refreshed entry is never dropped (H2).
+- `PUT /v1/admin/tiers/{identity}` bounds the identity the same way the check
+  path does, instead of writing an unbounded string to the shared store (L8).
+- `judge_latency_seconds` and `DecisionRecord.latency_ms` measure the judge
+  call alone; detection time is no longer attributed to the judge (M3).
 
 ### Fixed
 
@@ -174,5 +217,33 @@ Read this section before upgrading.
 - Request IDs were reflected without validation (B21).
 - Custom rule names with uppercase letters never matched (B22).
 - Docker Compose used an obsolete `version` key and an old Redis image (B24).
+- `judgment.budget.max_input_tokens_per_day` never took effect and
+  `judge_input_tokens_total` stayed at zero: nothing charged a judge's reported
+  usage against the budget. Judges may now report usage through
+  `judge.UsageReporter`, which the typesafe client implements and the
+  controller charges after every call (H1).
+- Decision records reported the mode captured at startup rather than the mode
+  actually in force, so every record still read `shadow` after an operator
+  flipped to enforce — the one field used to tell the two runs apart (M1).
+- The blast-radius guardrail (G5) divided by a population counted once before
+  the verdict loop, so a single cycle could escalate every suspect past
+  `max_non_normal_fraction` and only notice on the next cycle (M2).
+- Both tier stores grew without bound: expired entries were filtered on read
+  but never removed, while `List` was called twice per detection cycle and
+  every replica resynced the whole hash every ten seconds (H2).
+- The gateway's `/ready` used a limiter lookup that memory storage can never
+  fail, making readiness a constant 200 — the same pattern B19 fixed for
+  `serve` mode (L1).
+- A guardrail outcome that stayed at `normal` was audited with reason
+  "no tier configuration", because a real deployment never configures a
+  `normal` tier and the TTL lookup treats both cases alike (L2).
+- `Gateway.Start` returned the first listener's error without shutting the
+  other down, leaking a bound port for the life of the process (L7).
+- A data race on `Rule.Period`: rules named in `ratelimit.rules` were
+  normalized lazily inside `getRule`, on the request path, so their first
+  concurrent hits wrote to shared configuration. Rules are now normalized once
+  at construction and treated as immutable (L9).
+- `TestAggregatePrefixes` was order-dependent and could observe a snapshot
+  between an observation's two shard-locked writes (M7).
 
 [Unreleased]: https://github.com/nshekhawat/portcullis/commits/main

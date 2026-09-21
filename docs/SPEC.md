@@ -748,7 +748,9 @@ key:demo-int-7    throttle  misbehaving_client     0.79  -                      
 1. baseline users
 2. the attacks starting
 3. the shadow-mode decisions
-4. flipping to enforce via `PUT /v1/admin/config/mode`, which exists in demo builds only
+4. flipping to enforce via `PUT /v1/admin/config/mode` — this is a production admin endpoint, behind the
+   same bearer auth as the rest of `/v1/admin/*`, not something gated to demo builds; the demo simply
+   exercises the same shadow-to-enforce rollout an operator would use (see §9)
 5. the outage and fail-static behavior
 6. the Grafana dashboard
 
