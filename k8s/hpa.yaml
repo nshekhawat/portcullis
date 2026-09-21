@@ -1,14 +1,14 @@
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: rate-limiter
+  name: portcullis
   labels:
-    app: rate-limiter
+    app: portcullis
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: rate-limiter
+    name: portcullis
   minReplicas: 3
   maxReplicas: 10
   metrics:

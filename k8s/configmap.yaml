@@ -1,41 +1,60 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: rate-limiter-config
+  name: portcullis-config
   labels:
-    app: rate-limiter
+    app: portcullis
 data:
   config.yaml: |
     server:
       http_port: 8080
       grpc_port: 9090
       read_timeout: 10s
+      read_header_timeout: 5s
       write_timeout: 10s
+      idle_timeout: 60s
       shutdown_timeout: 30s
+      max_header_bytes: 65536
+      max_body_bytes: 8192
+      # Replace with the CIDRs of your ingress controllers.
+      trusted_proxies: []
+      grpc_reflection: false
+
+    admin:
+      tokens_env: PORTCULLIS_ADMIN_TOKENS
+
+    storage:
+      backend: redis
+      on_storage_error: deny
+
+    memory:
+      cleanup_interval: 1m
+      max_keys: 1000000
 
     redis:
       address: "redis:6379"
-      password: ""
-      db: 0
-      pool_size: 10
+      pool_size: 20
       min_idle_conns: 5
       dial_timeout: 5s
       read_timeout: 3s
       write_timeout: 3s
 
     ratelimit:
-      key_prefix: "rl:"
+      key_prefix: "pc:"
       ttl: 1h
-      default_rules:
-        - name: default
-          capacity: 100
-          refill_rate: 10
-          period: 1m
+      default_rule: { name: default, capacity: 100, refill_rate: 100, period: 1m }
+      rules:
+        login: { capacity: 10, refill_rate: 10, period: 1m }
+      bypass:
+        enabled: false
+        header: X-Portcullis-Bypass
+        secrets_env: PORTCULLIS_BYPASS_SECRETS
 
     metrics:
       enabled: true
-      path: "/metrics"
+      path: /metrics
 
     logging:
-      level: "info"
-      format: "json"
+      level: info
+      format: json
+      output: stdout

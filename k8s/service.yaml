@@ -1,9 +1,9 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: rate-limiter
+  name: portcullis
   labels:
-    app: rate-limiter
+    app: portcullis
 spec:
   type: ClusterIP
   ports:
@@ -16,14 +16,14 @@ spec:
       targetPort: grpc
       protocol: TCP
   selector:
-    app: rate-limiter
+    app: portcullis
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: rate-limiter-headless
+  name: portcullis-headless
   labels:
-    app: rate-limiter
+    app: portcullis
 spec:
   type: ClusterIP
   clusterIP: None
@@ -33,4 +33,4 @@ spec:
       targetPort: grpc
       protocol: TCP
   selector:
-    app: rate-limiter
+    app: portcullis

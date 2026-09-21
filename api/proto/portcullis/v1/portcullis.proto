@@ -1,0 +1,295 @@
+syntax = "proto3";
+
+package portcullis.v1;
+
+option go_package = "github.com/nshekhawat/portcullis/api/proto/portcullis/v1;portcullisv1";
+
+service RateLimiterService {
+  // CheckRateLimit checks if a request should be allowed based on rate limiting rules
+  rpc CheckRateLimit(CheckRequest) returns (CheckResponse);
+
+  // GetLimitStatus returns the current rate limit status for an identifier
+  rpc GetLimitStatus(StatusRequest) returns (StatusResponse);
+
+  // ResetLimit resets the rate limit for an identifier
+  rpc ResetLimit(ResetRequest) returns (ResetResponse);
+
+  // Report records a request the caller already served, so the detection plane
+  // can see traffic that never passed through the gateway. Public.
+  rpc Report(ReportRequest) returns (ReportResponse);
+}
+
+// AdminService is the operator surface. Every RPC requires an admin bearer
+// token.
+service AdminService {
+  // SetTier writes a manual tier entry for an identity.
+  rpc SetTier(SetTierRequest) returns (SetTierResponse);
+
+  // ClearTier removes an identity's tier entry. Idempotent.
+  rpc ClearTier(ClearTierRequest) returns (ClearTierResponse);
+
+  // ListTiers returns every active tier entry.
+  rpc ListTiers(ListTiersRequest) returns (ListTiersResponse);
+
+  // ListDecisions returns audit records, newest first.
+  rpc ListDecisions(ListDecisionsRequest) returns (ListDecisionsResponse);
+}
+
+// Attributes describes the request a check is being made for. It is optional
+// and only feeds the signals pipeline; it never affects the decision.
+message Attributes {
+  // Raw request path.
+  string path = 1;
+
+  // HTTP method.
+  string method = 2;
+
+  // Raw User-Agent header, classified by code, never by a model.
+  string user_agent = 3;
+}
+
+message CheckRequest {
+  // Unique identifier for the rate limit (e.g., IP address, API key, user ID)
+  string identifier = 1;
+
+  // Resource being accessed (e.g., endpoint path, API method)
+  string resource = 2;
+
+  // Number of tokens to consume (default: 1)
+  int64 tokens = 3;
+
+  // Optional request attributes for the signals pipeline.
+  Attributes attributes = 4;
+}
+
+message CheckResponse {
+  // Whether the request is allowed
+  bool allowed = 1;
+
+  // Maximum number of requests allowed in the window
+  int64 limit = 2;
+
+  // Number of requests remaining in the current window
+  int64 remaining = 3;
+
+  // Seconds until the rate limit resets (only set if not allowed)
+  int64 retry_after_seconds = 4;
+
+  // Unix timestamp when the rate limit will reset
+  int64 reset_at_unix = 5;
+}
+
+message StatusRequest {
+  // Unique identifier for the rate limit
+  string identifier = 1;
+
+  // Resource being accessed (optional, for resource-specific limits)
+  string resource = 2;
+}
+
+message StatusResponse {
+  // Maximum number of requests allowed in the window
+  int64 limit = 1;
+
+  // Number of requests remaining in the current window
+  int64 remaining = 2;
+
+  // Unix timestamp when the rate limit will reset
+  int64 reset_at_unix = 3;
+
+  // Current number of tokens available
+  double tokens_available = 4;
+}
+
+message ResetRequest {
+  // Unique identifier for the rate limit to reset
+  string identifier = 1;
+
+  // Resource to reset (optional, for resource-specific limits)
+  string resource = 2;
+}
+
+message ResetResponse {
+  // Whether the reset was successful
+  bool success = 1;
+
+  // Message describing the result
+  string message = 2;
+}
+
+message ReportRequest {
+  // Rate-limit identity of the client that made the request.
+  string identifier = 1;
+
+  // Route template or configured resource.
+  string resource = 2;
+
+  // Status code the caller served, or 0 when unknown.
+  int32 status = 3;
+
+  // Raw request path.
+  string path = 4;
+
+  // HTTP method.
+  string method = 5;
+
+  // Raw User-Agent header.
+  string user_agent = 6;
+}
+
+message ReportResponse {
+  // Whether the observation was accepted. Recording is lossy by design, so
+  // acceptance means "handed to the pipeline", not "retained".
+  bool accepted = 1;
+}
+
+message SetTierRequest {
+  // Identity the tier applies to.
+  string identity = 1;
+
+  // Tier name: normal | watch | throttle | strict | block.
+  string tier = 2;
+
+  // How long the entry lasts. Zero uses the configured tier TTL.
+  int64 ttl_seconds = 3;
+
+  // Operator-supplied note. Logged, never sent to an external service.
+  string reason = 4;
+}
+
+message SetTierResponse {
+  // Identity the stored entry applies to.
+  string identity = 1;
+
+  // Stored tier name.
+  string tier = 2;
+
+  // Unix timestamp when the entry expires, or 0 when it never does.
+  int64 until_unix = 3;
+
+  // Where the entry came from: "manual" for operator writes.
+  string source = 4;
+
+  // Audit record that produced the entry, when there was one.
+  string decision_id = 5;
+}
+
+message ClearTierRequest {
+  // Identity to clear.
+  string identity = 1;
+}
+
+message ClearTierResponse {
+  // Always true: clearing an absent entry is a success.
+  bool cleared = 1;
+}
+
+message ListTiersRequest {}
+
+message TierInfo {
+  // Identity the entry applies to.
+  string identity = 1;
+
+  // Tier name.
+  string tier = 2;
+
+  // Unix timestamp when the entry expires, or 0 when it never does.
+  int64 until_unix = 3;
+
+  // Where the entry came from.
+  string source = 4;
+
+  // Audit record that produced the entry, when there was one.
+  string decision_id = 5;
+}
+
+message ListTiersResponse {
+  // Active entries, ordered by identity.
+  repeated TierInfo tiers = 1;
+}
+
+message ListDecisionsRequest {
+  // Maximum records to return. Defaults to 100, capped at 1000.
+  int32 limit = 1;
+
+  // Only return records for this identity.
+  string identity = 2;
+
+  // Only return records with this judge label.
+  string label = 3;
+}
+
+message DecisionInfo {
+  // Audit record id.
+  string id = 1;
+
+  // Unix timestamp of the decision.
+  int64 at_unix = 2;
+
+  // Identity the decision was made for.
+  string identity = 3;
+
+  // Opaque suspect id used in the judge call.
+  string suspect_id = 4;
+
+  // Anomaly score.
+  double score = 5;
+
+  // Deterministic evidence flags.
+  repeated string evidence = 6;
+
+  // Judge that produced the verdict.
+  string judge = 7;
+
+  // Model version, when a model was involved.
+  string model = 8;
+
+  // Judge label.
+  string label = 9;
+
+  // Judge-reported confidence.
+  double confidence = 10;
+
+  // Tier the policy proposed.
+  string proposed_tier = 11;
+
+  // Tier the guardrails applied.
+  string applied_tier = 12;
+
+  // Tier in force before the decision.
+  string previous_tier = 13;
+
+  // Guardrails that fired.
+  repeated string guardrails_applied = 14;
+
+  // Human-readable reason for the outcome.
+  string reason = 15;
+
+  // Judgment mode in force.
+  string mode = 16;
+
+  // Decision latency in milliseconds.
+  double latency_ms = 17;
+
+  // Bucketed, label-safe view of the suspect.
+  FeatureInfo features = 18;
+}
+
+// FeatureInfo is the bucketed view of a suspect that was sent to the judge.
+message FeatureInfo {
+  string request_rate = 1;
+  string denied_share = 2;
+  string auth_fail_share = 3;
+  string not_found_share = 4;
+  string server_error_share = 5;
+  string timing_regularity = 6;
+  string route_diversity = 7;
+  string methods = 8;
+  string client_family = 9;
+  repeated string sampled_paths = 10;
+}
+
+message ListDecisionsResponse {
+  // Audit records, newest first.
+  repeated DecisionInfo decisions = 1;
+}

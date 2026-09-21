@@ -12,12 +12,24 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/nshekhawat/rate-limiter-go/api/proto"
-	"github.com/nshekhawat/rate-limiter-go/internal/ratelimiter"
-	"github.com/nshekhawat/rate-limiter-go/internal/storage"
+	pb "github.com/nshekhawat/portcullis/api/proto/portcullis/v1"
+	"github.com/nshekhawat/portcullis/internal/ratelimiter"
+	"github.com/nshekhawat/portcullis/internal/storage"
 )
+
+// testGRPCToken is the admin bearer token the test gRPC server accepts.
+const testGRPCToken = "grpc-admin-token"
+
+// adminCtx returns a context carrying the accepted admin bearer token.
+func adminCtx() context.Context {
+	return metadata.NewOutgoingContext(
+		context.Background(),
+		metadata.Pairs("authorization", "Bearer "+testGRPCToken),
+	)
+}
 
 func setupGRPCTest(t *testing.T) (pb.RateLimiterServiceClient, healthpb.HealthClient, func()) {
 	t.Helper()
@@ -28,7 +40,7 @@ func setupGRPCTest(t *testing.T) (pb.RateLimiterServiceClient, healthpb.HealthCl
 		DefaultRule: &ratelimiter.Rule{
 			Name:       "default",
 			Capacity:   10,
-			RefillRate: 0.1, // Low refill rate for predictable tests
+			RefillRate: 0.1, // tokens per second; low for predictable tests
 		},
 		TTL: time.Hour,
 	}
@@ -40,8 +52,9 @@ func setupGRPCTest(t *testing.T) (pb.RateLimiterServiceClient, healthpb.HealthCl
 		Port:              0,
 		MaxRecvMsgSize:    4 * 1024 * 1024,
 		MaxSendMsgSize:    4 * 1024 * 1024,
-		EnableReflection:  true,
+		EnableReflection:  false,
 		EnableHealthCheck: true,
+		AdminTokens:       []string{testGRPCToken},
 	}
 	server := NewGRPCServer(limiter, grpcConfig, nil)
 
@@ -138,11 +151,28 @@ func TestGRPCServer_CheckRateLimit(t *testing.T) {
 	})
 }
 
+// TestGRPC_TokensAboveCapacity verifies over-capacity token requests are a
+// caller error, mirroring the HTTP 400 (B9).
+func TestGRPC_TokensAboveCapacity(t *testing.T) {
+	client, _, cleanup := setupGRPCTest(t)
+	defer cleanup()
+
+	_, err := client.CheckRateLimit(context.Background(), &pb.CheckRequest{
+		Identifier: "overcapacity",
+		Tokens:     11, // capacity is 10
+	})
+
+	require.Error(t, err)
+	st, ok := status.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.InvalidArgument, st.Code())
+}
+
 func TestGRPCServer_GetLimitStatus(t *testing.T) {
 	client, _, cleanup := setupGRPCTest(t)
 	defer cleanup()
 
-	ctx := context.Background()
+	ctx := adminCtx()
 
 	t.Run("new key status", func(t *testing.T) {
 		resp, err := client.GetLimitStatus(ctx, &pb.StatusRequest{
@@ -187,7 +217,7 @@ func TestGRPCServer_ResetLimit(t *testing.T) {
 	client, _, cleanup := setupGRPCTest(t)
 	defer cleanup()
 
-	ctx := context.Background()
+	ctx := adminCtx()
 
 	// Exhaust limit
 	for i := 0; i < 10; i++ {
@@ -225,9 +255,7 @@ func TestGRPCServer_ResetLimit_MissingIdentifier(t *testing.T) {
 	client, _, cleanup := setupGRPCTest(t)
 	defer cleanup()
 
-	ctx := context.Background()
-
-	_, err := client.ResetLimit(ctx, &pb.ResetRequest{
+	_, err := client.ResetLimit(adminCtx(), &pb.ResetRequest{
 		Identifier: "",
 	})
 
@@ -235,6 +263,67 @@ func TestGRPCServer_ResetLimit_MissingIdentifier(t *testing.T) {
 	st, ok := status.FromError(err)
 	require.True(t, ok)
 	assert.Equal(t, codes.InvalidArgument, st.Code())
+}
+
+// TestGRPC_AdminInterceptor verifies admin RPCs require a bearer token while
+// public RPCs stay open (B4).
+func TestGRPC_AdminInterceptor(t *testing.T) {
+	client, _, cleanup := setupGRPCTest(t)
+	defer cleanup()
+
+	t.Run("no metadata rejected", func(t *testing.T) {
+		ctx := context.Background()
+
+		_, err := client.GetLimitStatus(ctx, &pb.StatusRequest{Identifier: "x"})
+		require.Error(t, err)
+		st, ok := status.FromError(err)
+		require.True(t, ok)
+		assert.Equal(t, codes.Unauthenticated, st.Code())
+
+		_, err = client.ResetLimit(ctx, &pb.ResetRequest{Identifier: "x"})
+		require.Error(t, err)
+		st, ok = status.FromError(err)
+		require.True(t, ok)
+		assert.Equal(t, codes.Unauthenticated, st.Code())
+	})
+
+	t.Run("wrong token rejected", func(t *testing.T) {
+		ctx := metadata.NewOutgoingContext(
+			context.Background(),
+			metadata.Pairs("authorization", "Bearer wrong-token"),
+		)
+
+		_, err := client.GetLimitStatus(ctx, &pb.StatusRequest{Identifier: "x"})
+		require.Error(t, err)
+		st, ok := status.FromError(err)
+		require.True(t, ok)
+		assert.Equal(t, codes.Unauthenticated, st.Code())
+
+		_, err = client.ResetLimit(ctx, &pb.ResetRequest{Identifier: "x"})
+		require.Error(t, err)
+		st, ok = status.FromError(err)
+		require.True(t, ok)
+		assert.Equal(t, codes.Unauthenticated, st.Code())
+	})
+
+	t.Run("valid token accepted", func(t *testing.T) {
+		ctx := adminCtx()
+
+		_, err := client.GetLimitStatus(ctx, &pb.StatusRequest{Identifier: "x"})
+		require.NoError(t, err)
+
+		_, err = client.ResetLimit(ctx, &pb.ResetRequest{Identifier: "x"})
+		require.NoError(t, err)
+	})
+
+	t.Run("check is public", func(t *testing.T) {
+		resp, err := client.CheckRateLimit(context.Background(), &pb.CheckRequest{
+			Identifier: "public-user",
+			Tokens:     1,
+		})
+		require.NoError(t, err)
+		assert.True(t, resp.Allowed)
+	})
 }
 
 func TestGRPCServer_HealthCheck(t *testing.T) {
@@ -251,7 +340,7 @@ func TestGRPCServer_HealthCheck(t *testing.T) {
 
 	t.Run("service health", func(t *testing.T) {
 		resp, err := healthClient.Check(ctx, &healthpb.HealthCheckRequest{
-			Service: "ratelimiter.RateLimiterService",
+			Service: "portcullis.v1.RateLimiterService",
 		})
 		require.NoError(t, err)
 		assert.Equal(t, healthpb.HealthCheckResponse_SERVING, resp.Status)
@@ -298,6 +387,12 @@ func TestGRPCServer_DefaultConfig(t *testing.T) {
 	assert.Equal(t, 9090, config.Port)
 	assert.Equal(t, 4*1024*1024, config.MaxRecvMsgSize)
 	assert.Equal(t, 4*1024*1024, config.MaxSendMsgSize)
-	assert.True(t, config.EnableReflection)
+	assert.False(t, config.EnableReflection)
 	assert.True(t, config.EnableHealthCheck)
+}
+
+// TestGRPC_ReflectionDisabledByDefault verifies the API surface is not exposed
+// through reflection unless explicitly enabled (B4).
+func TestGRPC_ReflectionDisabledByDefault(t *testing.T) {
+	assert.False(t, DefaultGRPCConfig().EnableReflection)
 }

@@ -1,24 +1,24 @@
-version: '3.8'
-
 services:
-  rate-limiter:
+  portcullis:
     build:
       context: .
       dockerfile: Dockerfile
+    image: ghcr.io/nshekhawat/portcullis:local
     ports:
       - "8080:8080"
       - "9090:9090"
     environment:
       - CONFIG_PATH=/config/config.yaml
-      - RATE_LIMITER_USE_REDIS=true
-      - RATE_LIMITER_REDIS_ADDRESS=redis:6379
+      - PORTCULLIS_STORAGE_BACKEND=redis
+      - PORTCULLIS_REDIS_ADDRESS=redis:6379
+      - PORTCULLIS_ADMIN_TOKENS=local-admin-token
     volumes:
       - ./config.yaml.example:/config/config.yaml:ro
     depends_on:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      test: ["CMD", "/usr/local/bin/portcullis", "healthcheck", "--url", "http://127.0.0.1:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -26,7 +26,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:8.10-alpine
     ports:
       - "6379:6379"
     volumes:

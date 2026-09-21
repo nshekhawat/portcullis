@@ -15,7 +15,10 @@ type Metrics struct {
 	RateLimitAllowed *prometheus.CounterVec
 	RateLimitDenied  *prometheus.CounterVec
 	TokensConsumed   *prometheus.CounterVec
-	TokensRemaining  *prometheus.GaugeVec
+
+	// RateLimitStorageFailures counts denied requests caused by the storage
+	// layer rather than by the caller's traffic. Labels carry no identity.
+	RateLimitStorageFailures *prometheus.CounterVec
 
 	// Storage metrics
 	StorageOperations     *prometheus.CounterVec
@@ -26,13 +29,30 @@ type Metrics struct {
 	// gRPC metrics
 	GRPCRequestsTotal   *prometheus.CounterVec
 	GRPCRequestDuration *prometheus.HistogramVec
+
+	// Judgment plane metrics (spec §5.11). None of these carry an identity,
+	// path or user agent label.
+	JudgeRequests     *prometheus.CounterVec
+	JudgeLatency      *prometheus.HistogramVec
+	JudgeSuspects     prometheus.Histogram
+	JudgeInputTokens  prometheus.Counter
+	Verdicts          *prometheus.CounterVec
+	TierTransitions   *prometheus.CounterVec
+	ActiveTiers       *prometheus.GaugeVec
+	TierDenials       *prometheus.CounterVec
+	GuardrailTrips    *prometheus.CounterVec
+	BreakerState      *prometheus.GaugeVec
+	SignalsDropped    prometheus.Counter
+	TrackedIdentities prometheus.Gauge
+	DetectionCycle    prometheus.Histogram
+	SuspectsSelected  prometheus.Counter
 }
 
 // DefaultMetrics is the global metrics instance.
 var DefaultMetrics *Metrics
 
 func init() {
-	DefaultMetrics = NewMetrics("ratelimiter")
+	DefaultMetrics = NewMetrics("portcullis")
 }
 
 // NewMetrics creates a new Metrics instance with the given namespace.
@@ -84,13 +104,13 @@ func NewMetrics(namespace string) *Metrics {
 			[]string{"identifier_type", "resource"},
 		),
 
-		TokensRemaining: promauto.NewGaugeVec(
-			prometheus.GaugeOpts{
+		RateLimitStorageFailures: promauto.NewCounterVec(
+			prometheus.CounterOpts{
 				Namespace: namespace,
-				Name:      "tokens_remaining",
-				Help:      "Current tokens remaining in buckets",
+				Name:      "ratelimit_storage_failures_total",
+				Help:      "Denied rate limit requests caused by the storage layer, by reason",
 			},
-			[]string{"identifier", "resource"},
+			[]string{"reason"},
 		),
 
 		StorageOperations: promauto.NewCounterVec(
@@ -148,6 +168,129 @@ func NewMetrics(namespace string) *Metrics {
 			},
 			[]string{"method"},
 		),
+
+		JudgeRequests: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Name:      "judge_requests_total",
+				Help:      "Judge calls by judge and outcome",
+			},
+			[]string{"judge", "outcome"},
+		),
+
+		JudgeLatency: promauto.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Namespace: namespace,
+				Name:      "judge_latency_seconds",
+				Help:      "Judge call latency in seconds",
+				Buckets:   []float64{.01, .05, .1, .25, .5, 1, 2, 5},
+			},
+			[]string{"judge"},
+		),
+
+		JudgeSuspects: promauto.NewHistogram(
+			prometheus.HistogramOpts{
+				Namespace: namespace,
+				Name:      "judge_suspects_per_call",
+				Help:      "Suspects carried by one judge call",
+				Buckets:   []float64{1, 2, 5, 10, 25, 50},
+			},
+		),
+
+		JudgeInputTokens: promauto.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Name:      "judge_input_tokens_total",
+				Help:      "Input tokens reported by judges",
+			},
+		),
+
+		Verdicts: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Name:      "verdicts_total",
+				Help:      "Verdicts by label and confidence band",
+			},
+			[]string{"label", "confidence_band"},
+		),
+
+		TierTransitions: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Name:      "tier_transitions_total",
+				Help:      "Tier changes by from, to and source",
+			},
+			[]string{"from", "to", "source"},
+		),
+
+		ActiveTiers: promauto.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "active_tiers",
+				Help:      "Identities currently holding each tier",
+			},
+			[]string{"tier"},
+		),
+
+		TierDenials: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Name:      "tier_denials_total",
+				Help:      "Requests refused because of an enforcement tier",
+			},
+			[]string{"tier"},
+		),
+
+		GuardrailTrips: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Name:      "guardrail_trips_total",
+				Help:      "Times a guardrail changed or blocked a decision",
+			},
+			[]string{"guardrail"},
+		),
+
+		BreakerState: promauto.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "breaker_state",
+				Help:      "Circuit breaker state: 0 closed, 1 half-open, 2 open",
+			},
+			[]string{"judge"},
+		),
+
+		SignalsDropped: promauto.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Name:      "signals_dropped_total",
+				Help:      "Observations dropped because the signals buffer was full",
+			},
+		),
+
+		TrackedIdentities: promauto.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "tracked_identities",
+				Help:      "Identities currently tracked by the signals aggregator",
+			},
+		),
+
+		DetectionCycle: promauto.NewHistogram(
+			prometheus.HistogramOpts{
+				Namespace: namespace,
+				Name:      "detection_cycle_seconds",
+				Help:      "Duration of one detection-to-judgment cycle",
+				Buckets:   []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 5},
+			},
+		),
+
+		SuspectsSelected: promauto.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Name:      "suspects_selected_total",
+				Help:      "Suspects selected across all detection cycles",
+			},
+		),
 	}
 }
 
@@ -165,11 +308,6 @@ func (m *Metrics) RecordRateLimitDecision(allowed bool, identifierType, resource
 	} else {
 		m.RateLimitDenied.WithLabelValues(identifierType, resource).Inc()
 	}
-}
-
-// RecordTokensRemaining records the current tokens remaining for an identifier.
-func (m *Metrics) RecordTokensRemaining(identifier, resource string, tokens float64) {
-	m.TokensRemaining.WithLabelValues(identifier, resource).Set(tokens)
 }
 
 // RecordStorageOperation records storage operation metrics.

@@ -7,7 +7,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	pb "github.com/nshekhawat/rate-limiter-go/api/proto"
+	pb "github.com/nshekhawat/portcullis/api/proto/portcullis/v1"
 )
 
 // GRPCClient is a gRPC-based rate limiter client.

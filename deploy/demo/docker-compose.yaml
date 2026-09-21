@@ -1,0 +1,137 @@
+# Portcullis demo stack: two gateway replicas behind nginx, an upstream, a fake
+# TypeSafe judge, Redis for shared state, and the traffic generator.
+#
+#   docker compose -f deploy/demo/docker-compose.yaml up --build
+#   docker compose -f deploy/demo/docker-compose.yaml --profile observability up
+#
+# The Makefile wraps both.
+name: portcullis-demo
+
+services:
+  redis:
+    image: redis:8.10-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [demo]
+
+  upstream:
+    build:
+      context: ../..
+      dockerfile: deploy/demo/Dockerfile
+    command: ["demo-upstream", "--addr", ":3000"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [demo]
+
+  mockjev:
+    build:
+      context: ../..
+      dockerfile: deploy/demo/Dockerfile
+    command: ["mockjev", "-addr", ":8099", "-latency", "120ms", "-jitter", "60ms", "-rate-limit-rpm", "1200"]
+    ports:
+      - "8099:8099"   # the chaos switch, for make demo-outage
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8099/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [demo]
+
+  gateway-a:
+    build:
+      context: ../..
+      dockerfile: deploy/demo/Dockerfile
+    command: ["portcullis", "gateway", "-config", "/etc/portcullis/config.yaml"]
+    ports:
+      - "8001:8081"   # the admin API, for `portcullis admin` and make demo
+    environment:
+      - PORTCULLIS_ADMIN_TOKENS=demo-admin-token
+      - TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-demo-key}
+      - PORTCULLIS_JUDGMENT_MODE=${PORTCULLIS_JUDGMENT_MODE:-shadow}
+      - PORTCULLIS_JUDGMENT_JUDGE=${PORTCULLIS_JUDGMENT_JUDGE:-typesafe}
+      - PORTCULLIS_JUDGMENT_TYPESAFE_BASE_URL=${TYPESAFE_BASE_URL:-http://mockjev:8099}
+      - PORTCULLIS_JUDGMENT_TYPESAFE_API_KEY_ENV=TYPESAFE_API_KEY
+      - PORTCULLIS_JUDGMENT_TYPESAFE_MODEL=${TYPESAFE_MODEL:-jev-1.13.0}
+    volumes:
+      - ./portcullis-gateway.yaml:/etc/portcullis/config.yaml:ro
+    depends_on:
+      redis: { condition: service_healthy }
+      upstream: { condition: service_healthy }
+      mockjev: { condition: service_healthy }
+    networks: [demo]
+
+  gateway-b:
+    build:
+      context: ../..
+      dockerfile: deploy/demo/Dockerfile
+    command: ["portcullis", "gateway", "-config", "/etc/portcullis/config.yaml"]
+    environment:
+      - PORTCULLIS_ADMIN_TOKENS=demo-admin-token
+      - TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-demo-key}
+      - PORTCULLIS_JUDGMENT_MODE=${PORTCULLIS_JUDGMENT_MODE:-shadow}
+      - PORTCULLIS_JUDGMENT_JUDGE=${PORTCULLIS_JUDGMENT_JUDGE:-typesafe}
+      - PORTCULLIS_JUDGMENT_TYPESAFE_BASE_URL=${TYPESAFE_BASE_URL:-http://mockjev:8099}
+      - PORTCULLIS_JUDGMENT_TYPESAFE_API_KEY_ENV=TYPESAFE_API_KEY
+      - PORTCULLIS_JUDGMENT_TYPESAFE_MODEL=${TYPESAFE_MODEL:-jev-1.13.0}
+    volumes:
+      - ./portcullis-gateway.yaml:/etc/portcullis/config.yaml:ro
+    depends_on:
+      redis: { condition: service_healthy }
+      upstream: { condition: service_healthy }
+      mockjev: { condition: service_healthy }
+    networks: [demo]
+
+  nginx:
+    image: nginx:stable-alpine
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [gateway-a, gateway-b]
+    networks: [demo]
+
+  trafficgen:
+    build:
+      context: ../..
+      dockerfile: deploy/demo/Dockerfile
+    # Parameterised so callers can just `run` the service without args.
+    command: ["trafficgen", "-scenario", "${TRAFFIC_SCENARIO:-mixed}", "-duration", "${TRAFFIC_DURATION:-120s}", "-target", "http://nginx:8000"]
+    profiles: [tools]
+    depends_on: [nginx]
+    networks: [demo]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    profiles: [observability]
+    networks: [demo]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/portcullis.json:/etc/grafana/dashboards/portcullis.json:ro
+    ports:
+      - "3000:3000"
+    profiles: [observability]
+    networks: [demo]
+
+networks:
+  demo:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

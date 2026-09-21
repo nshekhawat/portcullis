@@ -2,40 +2,109 @@
 package middleware
 
 import (
+	"crypto/subtle"
+	"errors"
 	"net/http"
+	"net/netip"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/nshekhawat/rate-limiter-go/internal/ratelimiter"
+	"github.com/nshekhawat/portcullis/internal/netx"
+	"github.com/nshekhawat/portcullis/internal/ratelimiter"
+	"github.com/nshekhawat/portcullis/internal/signals"
 )
+
+// unmatchedRoute is the resource used when no route matched the request. Using
+// the route template instead of the raw path keeps path-variation attacks and
+// unbounded key cardinality out of the limiter (B7).
+const unmatchedRoute = "__unmatched__"
 
 // RateLimitConfig holds configuration for the rate limit middleware.
 type RateLimitConfig struct {
+	// TrustedProxies lists CIDRs whose X-Forwarded-For headers are believed.
+	// Empty means trust nobody and use the peer address (B2).
+	TrustedProxies []netip.Prefix
+
 	// KeyFunc extracts the rate limit key from the request.
-	// If nil, defaults to using client IP.
+	// If nil, the resolved client IP is used.
 	KeyFunc func(*gin.Context) string
 
 	// ResourceFunc extracts the resource identifier from the request.
-	// If nil, defaults to using the request path.
+	// If nil, the matched route template (or "__unmatched__") is used.
 	ResourceFunc func(*gin.Context) string
 
 	// TokensFunc determines how many tokens to consume for a request.
-	// If nil, defaults to 1 token per request.
+	// If nil, one token per request.
 	TokensFunc func(*gin.Context) int64
 
-	// SkipFunc determines if rate limiting should be skipped for a request.
-	// If nil, rate limiting is applied to all requests.
+	// SkipFunc decides whether rate limiting is skipped for a request.
+	// The bypass check runs in addition to this.
 	SkipFunc func(*gin.Context) bool
 
-	// ErrorHandler handles rate limit errors.
-	// If nil, returns a default 500 error response.
+	// ErrorHandler handles internal rate limit errors.
+	// If nil, a fail-closed response is written.
 	ErrorHandler func(*gin.Context, error)
 
-	// RateLimitedHandler handles rate limited requests.
-	// If nil, returns a default 429 response.
+	// RateLimitedHandler handles denied requests.
+	// If nil, a default 429 response is written.
 	RateLimitedHandler func(*gin.Context, *ratelimiter.Decision)
+
+	// BypassEnabled turns on the secret-gated bypass (B3).
+	BypassEnabled bool
+	// BypassHeader is the header carrying the bypass secret.
+	BypassHeader string
+	// BypassSecrets are the accepted secrets. Without at least one, the bypass
+	// header is ignored entirely.
+	BypassSecrets []string
+
+	// Signals, when set, receives one observation per request after the handler
+	// has run, so the status code is known. Recording never blocks.
+	Signals signals.Recorder
+	// RouteOf, when set, overrides the route recorded in the observation. The
+	// rate-limit resource stays a bounded configured name; the observation route
+	// is what detection uses for diversity, so a proxy can report the path here.
+	RouteOf func(*gin.Context) string
+}
+
+// ClientIP resolves the originating client address for a request.
+func ClientIP(c *gin.Context, trusted []netip.Prefix) netip.Addr {
+	return netx.ClientIP(c.Request.RemoteAddr, c.Request.Header.Values("X-Forwarded-For"), trusted)
+}
+
+// IdentityKeyFunc returns a KeyFunc that derives the rate-limit identity from
+// an explicit identifier header, then an API key, then the resolved client IP.
+func IdentityKeyFunc(trusted []netip.Prefix, identifierHeader, apiKeyHeader string) func(*gin.Context) string {
+	return func(c *gin.Context) string {
+		var explicit, apiKey string
+		if identifierHeader != "" {
+			explicit = c.GetHeader(identifierHeader)
+		}
+		if apiKeyHeader != "" {
+			apiKey = c.GetHeader(apiKeyHeader)
+		}
+		return netx.Identity(explicit, apiKey, ClientIP(c, trusted))
+	}
+}
+
+// BypassAllowed reports whether the request presents a valid bypass secret.
+// The comparison is constant time so secrets cannot be probed byte by byte.
+func BypassAllowed(c *gin.Context, enabled bool, header string, secrets []string) bool {
+	if !enabled || header == "" || len(secrets) == 0 {
+		return false
+	}
+	value := c.GetHeader(header)
+	if value == "" {
+		return false
+	}
+	for _, secret := range secrets {
+		if subtle.ConstantTimeCompare([]byte(value), []byte(secret)) == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // RateLimitMiddleware creates a Gin middleware for rate limiting.
@@ -47,62 +116,58 @@ func RateLimitMiddleware(limiter *ratelimiter.RateLimiter, config *RateLimitConf
 		logger = zap.NewNop()
 	}
 
-	// Set default key function (client IP)
 	keyFunc := config.KeyFunc
 	if keyFunc == nil {
-		keyFunc = func(c *gin.Context) string {
-			return ratelimiter.ExtractIPFromRequest(
-				c.GetHeader("X-Forwarded-For"),
-				c.Request.RemoteAddr,
-			)
-		}
+		keyFunc = IdentityKeyFunc(config.TrustedProxies, "", "")
 	}
 
-	// Set default resource function (request path)
 	resourceFunc := config.ResourceFunc
 	if resourceFunc == nil {
 		resourceFunc = func(c *gin.Context) string {
-			return c.Request.URL.Path
+			if route := c.FullPath(); route != "" {
+				return route
+			}
+			return unmatchedRoute
 		}
 	}
 
-	// Set default tokens function (1 token)
 	tokensFunc := config.TokensFunc
 	if tokensFunc == nil {
-		tokensFunc = func(c *gin.Context) int64 {
-			return 1
-		}
+		tokensFunc = func(*gin.Context) int64 { return 1 }
 	}
 
-	// Set default error handler
 	errorHandler := config.ErrorHandler
 	if errorHandler == nil {
 		errorHandler = func(c *gin.Context, err error) {
+			if errors.Is(err, ratelimiter.ErrInvalidTokens) || errors.Is(err, ratelimiter.ErrInvalidIdentifier) ||
+				errors.Is(err, ratelimiter.ErrInvalidResource) {
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			// Fail closed: an unusable limiter must not become an open door.
 			logger.Error("rate limit error", zap.Error(err))
-			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
-				"error": "internal server error",
-			})
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "rate limiter unavailable"})
 		}
 	}
 
-	// Set default rate limited handler
 	rateLimitedHandler := config.RateLimitedHandler
 	if rateLimitedHandler == nil {
 		rateLimitedHandler = func(c *gin.Context, decision *ratelimiter.Decision) {
-			c.Header("X-RateLimit-Limit", strconv.FormatInt(decision.Limit, 10))
-			c.Header("X-RateLimit-Remaining", "0")
-			c.Header("X-RateLimit-Reset", strconv.FormatInt(decision.ResetAt.Unix(), 10))
-			c.Header("Retry-After", strconv.FormatInt(int64(decision.RetryAfter.Seconds()), 10))
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-				"error":       "rate limit exceeded",
-				"retry_after": int64(decision.RetryAfter.Seconds()),
-			})
+			writeDenial(c, decision)
 		}
 	}
 
+	var record recorder
+	if config.Signals != nil {
+		record = newRecorder(config.Signals, config.RouteOf)
+	}
+
 	return func(c *gin.Context) {
-		// Check if rate limiting should be skipped
 		if config.SkipFunc != nil && config.SkipFunc(c) {
+			c.Next()
+			return
+		}
+		if BypassAllowed(c, config.BypassEnabled, config.BypassHeader, config.BypassSecrets) {
 			c.Next()
 			return
 		}
@@ -117,99 +182,134 @@ func RateLimitMiddleware(limiter *ratelimiter.RateLimiter, config *RateLimitConf
 			return
 		}
 
-		// Set rate limit headers on all responses
 		c.Header("X-RateLimit-Limit", strconv.FormatInt(decision.Limit, 10))
 		c.Header("X-RateLimit-Remaining", strconv.FormatInt(decision.Remaining, 10))
 		c.Header("X-RateLimit-Reset", strconv.FormatInt(decision.ResetAt.Unix(), 10))
 
 		if !decision.Allowed {
 			rateLimitedHandler(c, decision)
+			// Denied requests are the interesting ones: record them too, with
+			// the denial status already written.
+			if record != nil {
+				record(c, key, resource, decision.Allowed)
+			}
 			return
 		}
 
 		c.Next()
+		if record != nil {
+			record(c, key, resource, decision.Allowed)
+		}
 	}
 }
 
-// IPBasedRateLimiter creates a simple IP-based rate limiter middleware.
+// recorder observes one finished request.
+type recorder func(c *gin.Context, identity, route string, allowed bool)
+
+// newRecorder adapts a signals recorder to the middleware's per-request state.
+//
+// It runs after the handler so the status code is known. The recorder itself
+// must not block, which is what keeps this off the latency path.
+func newRecorder(rec signals.Recorder, routeOf func(*gin.Context) string) recorder {
+	return func(c *gin.Context, identity, route string, allowed bool) {
+		if routeOf != nil {
+			route = routeOf(c)
+		}
+
+		status := 0
+		if c.Writer != nil {
+			status = c.Writer.Status()
+		}
+
+		rec.Record(signals.Observation{
+			Identity: identity,
+			Route:    route,
+			Path:     c.Request.URL.Path,
+			Method:   c.Request.Method,
+			Status:   status,
+			UAFamily: signals.ClassifyUA(c.GetHeader("User-Agent")),
+			Allowed:  allowed,
+			At:       time.Now(),
+		})
+	}
+}
+
+// writeDenial writes the standard denial response, choosing 503 when the
+// limiter could not reach its storage and 429 otherwise.
+func writeDenial(c *gin.Context, decision *ratelimiter.Decision) {
+	retryAfter := ratelimiter.RetryAfterSeconds(decision.RetryAfter)
+	c.Header("Retry-After", strconv.FormatInt(retryAfter, 10))
+
+	status := http.StatusTooManyRequests
+	if decision.Reason == ratelimiter.ReasonStorageError || decision.Reason == ratelimiter.ReasonCapacity {
+		status = http.StatusServiceUnavailable
+	}
+	c.AbortWithStatusJSON(status, gin.H{
+		"error":       "rate limit exceeded",
+		"retry_after": retryAfter,
+	})
+}
+
+// IPBasedRateLimiter creates an IP-based rate limiter middleware that trusts
+// no proxy headers.
 func IPBasedRateLimiter(limiter *ratelimiter.RateLimiter, logger *zap.Logger) gin.HandlerFunc {
-	return RateLimitMiddleware(limiter, nil, logger)
+	return RateLimitMiddleware(limiter, &RateLimitConfig{}, logger)
 }
 
-// APIKeyRateLimiter creates an API key-based rate limiter middleware.
-func APIKeyRateLimiter(limiter *ratelimiter.RateLimiter, headerName string, logger *zap.Logger) gin.HandlerFunc {
-	config := &RateLimitConfig{
-		KeyFunc: func(c *gin.Context) string {
-			apiKey := c.GetHeader(headerName)
-			if apiKey == "" {
-				// Fall back to IP if no API key
-				return ratelimiter.ExtractIPFromRequest(
-					c.GetHeader("X-Forwarded-For"),
-					c.Request.RemoteAddr,
-				)
-			}
-			return apiKey
-		},
-	}
-	return RateLimitMiddleware(limiter, config, logger)
+// APIKeyRateLimiter creates an API-key based rate limiter middleware, falling
+// back to the client IP when the header is absent.
+func APIKeyRateLimiter(limiter *ratelimiter.RateLimiter, headerName string, trusted []netip.Prefix, logger *zap.Logger) gin.HandlerFunc {
+	return RateLimitMiddleware(limiter, &RateLimitConfig{
+		TrustedProxies: trusted,
+		KeyFunc:        IdentityKeyFunc(trusted, "", headerName),
+	}, logger)
 }
 
-// PathBasedRateLimiter creates a path-based rate limiter middleware.
-// Different paths can have different rate limits if configured.
-func PathBasedRateLimiter(limiter *ratelimiter.RateLimiter, logger *zap.Logger) gin.HandlerFunc {
-	config := &RateLimitConfig{
-		KeyFunc: func(c *gin.Context) string {
-			ip := ratelimiter.ExtractIPFromRequest(
-				c.GetHeader("X-Forwarded-For"),
-				c.Request.RemoteAddr,
-			)
-			return ip
-		},
-		ResourceFunc: func(c *gin.Context) string {
-			// Use the matched route path for consistent resource identification
-			return c.FullPath()
-		},
-	}
-	return RateLimitMiddleware(limiter, config, logger)
+// PathBasedRateLimiter creates a rate limiter whose resource is the matched
+// route template, so different paths can carry different rules.
+func PathBasedRateLimiter(limiter *ratelimiter.RateLimiter, trusted []netip.Prefix, logger *zap.Logger) gin.HandlerFunc {
+	return RateLimitMiddleware(limiter, &RateLimitConfig{
+		TrustedProxies: trusted,
+		KeyFunc:        IdentityKeyFunc(trusted, "", ""),
+	}, logger)
 }
 
-// WhitelistMiddleware creates a middleware that skips rate limiting for certain IPs or headers.
-func WhitelistMiddleware(whitelistedIPs, bypassHeaders []string) func(*gin.Context) bool {
-	ipSet := make(map[string]bool)
-	for _, ip := range whitelistedIPs {
-		ipSet[ip] = true
+// WhitelistMiddleware builds a SkipFunc for allowlisted addresses or a valid
+// bypass secret. The allowlist takes CIDRs; a bare address is a single host.
+func WhitelistMiddleware(whitelistedIPs []string, trusted []netip.Prefix, bypassEnabled bool, bypassHeader string, bypassSecrets []string) (func(*gin.Context) bool, error) {
+	allowed, err := netx.ParsePrefixes(whitelistedIPs)
+	if err != nil {
+		return nil, err
 	}
 
 	return func(c *gin.Context) bool {
-		// Check IP whitelist
-		clientIP := ratelimiter.ExtractIPFromRequest(
-			c.GetHeader("X-Forwarded-For"),
-			c.Request.RemoteAddr,
-		)
-		if ipSet[clientIP] {
+		if ip := ClientIP(c, trusted); ip.IsValid() && netx.Trusted(ip, allowed) {
 			return true
 		}
-
-		// Check bypass headers
-		for _, header := range bypassHeaders {
-			if c.GetHeader(header) != "" {
-				return true
-			}
-		}
-
-		return false
-	}
+		return BypassAllowed(c, bypassEnabled, bypassHeader, bypassSecrets)
+	}, nil
 }
 
-// CORSMiddleware adds CORS headers to responses.
-func CORSMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Request-ID")
-		c.Header("Access-Control-Expose-Headers", "X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After")
+// CORSMiddleware adds CORS headers for the listed origins. With no origins
+// configured no CORS headers are emitted at all.
+//
+// It must never be applied to admin routes (B4).
+func CORSMiddleware(origins ...string) gin.HandlerFunc {
+	allowed := make(map[string]bool, len(origins))
+	for _, o := range origins {
+		allowed[o] = true
+	}
 
-		if c.Request.Method == "OPTIONS" {
+	return func(c *gin.Context) {
+		if origin := c.GetHeader("Origin"); origin != "" && allowed[origin] {
+			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Vary", "Origin")
+			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Request-ID")
+			c.Header("Access-Control-Expose-Headers", "X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After")
+		}
+
+		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}

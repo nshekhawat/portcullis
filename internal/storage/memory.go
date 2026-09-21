@@ -2,37 +2,80 @@ package storage
 
 import (
 	"context"
+	"hash/fnv"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/nshekhawat/portcullis/internal/bucket"
+	"github.com/nshekhawat/portcullis/internal/clock"
 )
 
-// memoryEntry stores a bucket state with its expiration time and a mutex for atomic operations.
+// memoryStripes is the number of mutex stripes guarding the map. It bounds the
+// memory used for locking regardless of key churn (B5).
+const memoryStripes = 4096
+
+// memoryEntry stores a bucket state with its expiration time.
 type memoryEntry struct {
-	mu        sync.Mutex
 	state     *BucketState
 	expiresAt time.Time
 }
 
-// MemoryStorage implements the Storage interface using in-memory storage.
-// It is suitable for single-instance deployments or testing.
+// MemoryOptions configures a MemoryStorage.
+type MemoryOptions struct {
+	// CleanupInterval is how often expired entries are swept. Defaults to 1m.
+	CleanupInterval time.Duration
+	// MaxKeys caps the number of live buckets. When the cap is reached expired
+	// entries are evicted first; if none can be freed, new keys are rejected
+	// with ErrCapacity. Zero means the default of 1,000,000.
+	MaxKeys int
+	// Clock is the time source. Defaults to the system clock.
+	Clock clock.Clock
+}
+
+// MemoryStorage implements AtomicStorage with in-memory storage.
+// It is suitable for single-instance deployments and tests.
 type MemoryStorage struct {
-	data          sync.Map
-	locks         sync.Map // Per-key locks for atomic operations
+	data    sync.Map // key -> *memoryEntry
+	stripes [memoryStripes]sync.Mutex
+	clock   clock.Clock
+
+	count   atomic.Int64
+	maxKeys int
+
 	cleanupTicker *time.Ticker
 	done          chan struct{}
 	closed        bool
 	closeMu       sync.Mutex
+
+	// betweenExpiryCheckAndDelete runs inside evictExpired after an entry has
+	// been judged expired but before it is removed. Tests use it to interleave
+	// a refresh and prove the fresh entry survives (B6). Nil in production.
+	betweenExpiryCheckAndDelete func(key string)
 }
 
-// NewMemoryStorage creates a new in-memory storage instance.
-// It starts a background goroutine for TTL cleanup with the specified interval.
+// NewMemoryStorage creates a MemoryStorage with the given cleanup interval and
+// default capacity.
 func NewMemoryStorage(cleanupInterval time.Duration) *MemoryStorage {
-	if cleanupInterval <= 0 {
-		cleanupInterval = time.Minute
+	return NewMemoryStorageWithOptions(MemoryOptions{CleanupInterval: cleanupInterval})
+}
+
+// NewMemoryStorageWithOptions creates a MemoryStorage from explicit options.
+func NewMemoryStorageWithOptions(opts MemoryOptions) *MemoryStorage {
+	if opts.CleanupInterval <= 0 {
+		opts.CleanupInterval = time.Minute
+	}
+	if opts.MaxKeys <= 0 {
+		opts.MaxKeys = 1_000_000
+	}
+	if opts.Clock == nil {
+		opts.Clock = clock.System()
 	}
 
 	ms := &MemoryStorage{
-		cleanupTicker: time.NewTicker(cleanupInterval),
+		clock:         opts.Clock,
+		maxKeys:       opts.MaxKeys,
+		cleanupTicker: time.NewTicker(opts.CleanupInterval),
 		done:          make(chan struct{}),
 	}
 
@@ -41,13 +84,19 @@ func NewMemoryStorage(cleanupInterval time.Duration) *MemoryStorage {
 	return ms
 }
 
-// getLock returns the mutex for a given key, creating one if it doesn't exist.
-func (ms *MemoryStorage) getLock(key string) *sync.Mutex {
-	lock, _ := ms.locks.LoadOrStore(key, &sync.Mutex{})
-	return lock.(*sync.Mutex) //nolint:errcheck // type assertion is safe here
+// stripeFor returns the mutex guarding a key. Different keys usually hash to
+// different stripes; a collision only costs a little contention.
+func (ms *MemoryStorage) stripeFor(key string) *sync.Mutex {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(key)) // hash.Hash never returns an error
+	return &ms.stripes[h.Sum64()%memoryStripes]
 }
 
-// cleanupLoop periodically removes expired entries.
+// Len reports the number of tracked buckets. It is approximate under
+// concurrency but exact when the storage is quiescent.
+func (ms *MemoryStorage) Len() int { return int(ms.count.Load()) }
+
+// cleanupLoop sweeps expired entries until Close.
 func (ms *MemoryStorage) cleanupLoop() {
 	for {
 		select {
@@ -59,22 +108,39 @@ func (ms *MemoryStorage) cleanupLoop() {
 	}
 }
 
-// cleanup removes all expired entries.
+// cleanup removes expired entries.
+//
+// It compares-and-deletes the exact entry it observed, so a fresh bucket stored
+// by a concurrent request is never removed and the limit never silently resets
+// (B6).
 func (ms *MemoryStorage) cleanup() {
-	now := time.Now()
-	ms.data.Range(func(key, value interface{}) bool {
+	ms.evictExpired()
+}
+
+// evictExpired removes every expired entry and reports how many it removed.
+func (ms *MemoryStorage) evictExpired() int {
+	now := ms.clock.Now()
+	removed := 0
+	ms.data.Range(func(key, value any) bool {
 		entry, ok := value.(*memoryEntry)
 		if !ok {
 			return true
 		}
-		entry.mu.Lock()
-		expired := !entry.expiresAt.IsZero() && now.After(entry.expiresAt)
-		entry.mu.Unlock()
-		if expired {
-			ms.data.Delete(key)
+		if entry.expiresAt.IsZero() || now.Before(entry.expiresAt) {
+			return true
+		}
+		if ms.betweenExpiryCheckAndDelete != nil {
+			if keyStr, ok := key.(string); ok {
+				ms.betweenExpiryCheckAndDelete(keyStr)
+			}
+		}
+		if ms.data.CompareAndDelete(key, entry) {
+			ms.count.Add(-1)
+			removed++
 		}
 		return true
 	})
+	return removed
 }
 
 // Get retrieves the bucket state for the given key.
@@ -87,21 +153,18 @@ func (ms *MemoryStorage) Get(ctx context.Context, key string) (*BucketState, err
 	if !ok {
 		return nil, nil
 	}
-
 	entry, ok := value.(*memoryEntry)
 	if !ok {
 		return nil, nil
 	}
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
 
-	// Check if expired
-	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
-		ms.data.Delete(key)
+	if expired(entry, ms.clock.Now()) {
+		if ms.data.CompareAndDelete(key, entry) {
+			ms.count.Add(-1)
+		}
 		return nil, nil
 	}
 
-	// Return a copy to prevent external modification
 	stateCopy := *entry.state
 	return &stateCopy, nil
 }
@@ -112,18 +175,37 @@ func (ms *MemoryStorage) Set(ctx context.Context, key string, state *BucketState
 		return err
 	}
 
-	// Store a copy to prevent external modification
+	lock := ms.stripeFor(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if _, loaded := ms.data.Load(key); !loaded {
+		if err := ms.reserveKey(); err != nil {
+			return err
+		}
+	}
+
 	stateCopy := *state
-	entry := &memoryEntry{
-		state: &stateCopy,
-	}
-
+	entry := &memoryEntry{state: &stateCopy}
 	if ttl > 0 {
-		entry.expiresAt = time.Now().Add(ttl)
+		entry.expiresAt = ms.clock.Now().Add(ttl)
 	}
-
 	ms.data.Store(key, entry)
 	return nil
+}
+
+// reserveKey accounts for a new key, evicting expired entries before giving up.
+// Must be called with the key's stripe held.
+func (ms *MemoryStorage) reserveKey() error {
+	if ms.count.Load() < int64(ms.maxKeys) {
+		ms.count.Add(1)
+		return nil
+	}
+	if ms.evictExpired() > 0 {
+		ms.count.Add(1)
+		return nil
+	}
+	return ErrCapacity
 }
 
 // Delete removes the bucket state for the given key.
@@ -132,7 +214,9 @@ func (ms *MemoryStorage) Delete(ctx context.Context, key string) error {
 		return err
 	}
 
-	ms.data.Delete(key)
+	if _, loaded := ms.data.LoadAndDelete(key); loaded {
+		ms.count.Add(-1)
+	}
 	return nil
 }
 
@@ -144,14 +228,13 @@ func (ms *MemoryStorage) Close() error {
 	if ms.closed {
 		return nil
 	}
-
 	ms.closed = true
 	ms.cleanupTicker.Stop()
 	close(ms.done)
 	return nil
 }
 
-// Ping checks if the storage is healthy.
+// Ping reports whether the storage is usable.
 func (ms *MemoryStorage) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -159,80 +242,56 @@ func (ms *MemoryStorage) Ping(ctx context.Context) error {
 
 	ms.closeMu.Lock()
 	defer ms.closeMu.Unlock()
-
 	if ms.closed {
 		return ErrStorageClosed
 	}
-
 	return nil
 }
 
-// CheckAndConsume atomically checks if tokens are available and consumes them.
-// For in-memory storage, this uses per-key locks for atomicity.
+// CheckAndConsume atomically checks for and consumes tokens.
+//
+// The passed capacity and refill rate always win: a rule change applies to
+// existing buckets immediately, and stored tokens are clamped to the new
+// capacity (B11).
 func (ms *MemoryStorage) CheckAndConsume(ctx context.Context, key string, tokens, capacity int64, refillRate float64, ttl time.Duration) (*ConsumeResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	// Get per-key lock for atomic operation
-	lock := ms.getLock(key)
+	lock := ms.stripeFor(key)
 	lock.Lock()
 	defer lock.Unlock()
 
-	now := time.Now()
+	now := ms.clock.Now()
 
-	// Load or create entry
-	var state *BucketState
-	var entry *memoryEntry
-
-	value, loaded := ms.data.Load(key)
-
-	if loaded {
-		var ok bool
-		entry, ok = value.(*memoryEntry)
-		if !ok {
-			loaded = false
-		} else {
-			// Check if expired
-			if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
-				loaded = false
-			} else {
-				// Work with a copy of the state
-				stateCopy := *entry.state
-				state = &stateCopy
-			}
+	var state bucket.State
+	needsNew := true
+	if value, ok := ms.data.Load(key); ok {
+		if entry, isEntry := value.(*memoryEntry); isEntry && !expired(entry, now) {
+			state = bucket.State{Tokens: entry.state.Tokens, LastRefill: entry.state.LastRefillTime}
+			needsNew = false
+		} else if ms.data.CompareAndDelete(key, value) {
+			// Stale or unexpected value: drop it and keep the key count honest.
+			ms.count.Add(-1)
 		}
 	}
+	if needsNew {
+		if err := ms.reserveKey(); err != nil {
+			return nil, err
+		}
+		state = bucket.State{Tokens: float64(capacity), LastRefill: now}
+	}
 
-	if !loaded {
-		// Create new bucket at full capacity
-		state = &BucketState{
-			Tokens:         float64(capacity),
-			LastRefillTime: now,
+	state = bucket.Refill(state, capacity, refillRate, now)
+	state, allowed := bucket.Take(state, tokens)
+
+	newEntry := &memoryEntry{
+		state: &BucketState{
+			Tokens:         state.Tokens,
+			LastRefillTime: state.LastRefill,
 			Capacity:       capacity,
 			RefillRate:     refillRate,
-		}
-	}
-
-	// Calculate refill
-	elapsed := now.Sub(state.LastRefillTime).Seconds()
-	if elapsed > 0 {
-		state.Tokens += elapsed * state.RefillRate
-		if state.Tokens > float64(state.Capacity) {
-			state.Tokens = float64(state.Capacity)
-		}
-		state.LastRefillTime = now
-	}
-
-	// Check if we can consume
-	allowed := state.Tokens >= float64(tokens)
-	if allowed {
-		state.Tokens -= float64(tokens)
-	}
-
-	// Store updated state (create new entry to avoid races)
-	newEntry := &memoryEntry{
-		state: state,
+		},
 	}
 	if ttl > 0 {
 		newEntry.expiresAt = now.Add(ttl)
@@ -242,11 +301,16 @@ func (ms *MemoryStorage) CheckAndConsume(ctx context.Context, key string, tokens
 	return &ConsumeResult{
 		Allowed:        allowed,
 		CurrentTokens:  state.Tokens,
-		Capacity:       state.Capacity,
-		RefillRate:     state.RefillRate,
-		LastRefillTime: state.LastRefillTime,
+		Capacity:       capacity,
+		RefillRate:     refillRate,
+		LastRefillTime: state.LastRefill,
 	}, nil
 }
 
-// Ensure MemoryStorage implements AtomicStorage
+// expired reports whether an entry has passed its expiry time.
+func expired(entry *memoryEntry, now time.Time) bool {
+	return !entry.expiresAt.IsZero() && !now.Before(entry.expiresAt)
+}
+
+// Ensure MemoryStorage implements AtomicStorage.
 var _ AtomicStorage = (*MemoryStorage)(nil)

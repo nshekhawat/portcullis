@@ -1,0 +1,96 @@
+{
+  "title": "Portcullis",
+  "uid": "portcullis",
+  "tags": ["portcullis", "rate-limiting"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Active tiers",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum by (tier) (portcullis_active_tiers)", "legendFormat": "{{tier}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Verdicts by label",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "sum by (label) (rate(portcullis_verdicts_total[5m]))", "legendFormat": "{{label}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Judge latency (p50 / p95)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum by (le, judge) (rate(portcullis_judge_latency_seconds_bucket[5m])))", "legendFormat": "p50 {{judge}}" },
+        { "expr": "histogram_quantile(0.95, sum by (le, judge) (rate(portcullis_judge_latency_seconds_bucket[5m])))", "legendFormat": "p95 {{judge}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "state-timeline",
+      "title": "Breaker state (0 closed, 1 half-open, 2 open)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "max by (judge) (portcullis_breaker_state)", "legendFormat": "{{judge}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Allowed vs denied requests",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "sum(rate(portcullis_ratelimit_allowed_total[1m]))", "legendFormat": "allowed" },
+        { "expr": "sum(rate(portcullis_ratelimit_denied_total[1m]))", "legendFormat": "denied" },
+        { "expr": "sum(rate(portcullis_tier_denials_total[1m]))", "legendFormat": "denied by tier" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Gateway request latency (p99)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(portcullis_http_request_duration_seconds_bucket[1m])))", "legendFormat": "p99" },
+        { "expr": "histogram_quantile(0.5, sum by (le) (rate(portcullis_http_request_duration_seconds_bucket[1m])))", "legendFormat": "p50" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Guardrail trips",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 24 },
+      "targets": [
+        { "expr": "sum by (guardrail) (increase(portcullis_guardrail_trips_total[15m]))", "legendFormat": "{{guardrail}}" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Tracked identities",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 24 },
+      "targets": [
+        { "expr": "max(portcullis_tracked_identities)", "legendFormat": "tracked" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Dropped observations",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 24 },
+      "targets": [
+        { "expr": "sum(increase(portcullis_signals_dropped_total[15m]))", "legendFormat": "dropped" }
+      ]
+    }
+  ]
+}

@@ -1,378 +1,207 @@
-# Rate Limiter Service
+# Portcullis
 
-A high-performance, distributed rate limiting service implementing the token bucket algorithm. Built with Go, it provides both HTTP REST and gRPC APIs for rate limit enforcement.
+Deterministic rate limiting with a calibrated judgment plane.
 
-## Features
+A portcullis is a castle gate that drops instantly. A gatekeeper decides how far
+to lower it. Portcullis splits those jobs the same way: a token bucket enforces
+in microseconds, and an asynchronous, bounded, fail-static judgment plane assigns
+the policy tiers.
 
-- **Token Bucket Algorithm**: Precise rate limiting with configurable burst support
-- **Dual API Support**: HTTP REST and gRPC interfaces
-- **Distributed Mode**: Redis backend for cluster-wide rate limiting
-- **In-Memory Mode**: Fast local rate limiting without external dependencies
-- **Flexible Key Extraction**: Rate limit by IP, API key, user ID, headers, or custom strategies
-- **Prometheus Metrics**: Built-in observability and monitoring
-- **Kubernetes Ready**: Includes manifests for deployment, HPA, and service discovery
-- **Health Checks**: HTTP and gRPC health endpoints for container orchestration
-- **Graceful Shutdown**: Clean resource cleanup on termination
+**Calibrated semantic triage for L7 abuse — deterministic enforcement,
+AI-assigned policy tiers.** Portcullis does not stop volumetric L3/L4 DDoS; that
+belongs at upstream scrubbing.
 
-## Quick Start
+## Quickstart
 
-### Prerequisites
-
-- Go 1.23 or later
-- Redis (optional, for distributed mode)
-- Docker (optional, for containerized deployment)
-
-### Installation
+Requires Go 1.27 (the module declares `go 1.26.0` with `toolchain go1.27.1`, and
+Go will fetch the toolchain if needed).
 
 ```bash
-# Clone the repository
-git clone https://github.com/nshekhawat/rate-limiter-go.git
-cd rate-limiter-go
+git clone https://github.com/nshekhawat/portcullis.git
+cd portcullis
 
-# Download dependencies
-go mod download
+# Build and run the check API on :8080 (HTTP) and :9090 (gRPC).
+make build
+./bin/portcullis serve
 
-# Build the binary
-go build -o bin/ratelimiter ./cmd/ratelimiter
+# In another shell: ask if a request is allowed.
+curl -s -X POST http://127.0.0.1:8080/v1/check \
+  -H 'Content-Type: application/json' \
+  -d '{"identifier":"203.0.113.7","resource":"login"}'
+# {"allowed":true,"limit":100,"remaining":99,"reset_at_unix":...}
 ```
 
-### Running Locally
+Run it in front of an application instead:
 
 ```bash
-# Run with in-memory storage (default)
-./bin/ratelimiter
-
-# Run with Redis storage
-RATE_LIMITER_USE_REDIS=true ./bin/ratelimiter
+./bin/portcullis gateway --upstream http://127.0.0.1:3000 --listen :8000 --admin-listen :8081
 ```
 
-The service will start on:
-- HTTP: `http://localhost:8080`
-- gRPC: `localhost:9090`
+Or with containers:
+
+```bash
+make docker
+docker run -p 8080:8080 -p 9090:9090 ghcr.io/nshekhawat/portcullis:latest
+```
+
+## The demo
+
+The demo stack runs everything, with no API key: two gateway replicas behind
+nginx, a demo application, a fake TypeSafe judge, Redis for shared state, and a
+traffic generator that plays out real abuse shapes.
+
+```bash
+make demo                 # ~2 minutes; starts in shadow, prints the live tier table
+make demo JUDGE=typesafe  # the real model; needs TYPESAFE_API_KEY
+make demo-outage          # fails the judge for 30s and shows fail-static behavior
+make demo-down
+```
+
+While it runs:
+
+```bash
+./bin/portcullis admin tiers --watch
+./bin/portcullis admin decisions --limit 25
+./bin/portcullis admin mode enforce      # start enforcing what shadow was deciding
+./bin/portcullis admin set-tier 203.0.113.7 throttle --ttl 15m
+```
+
+See [scripts/demo-walkthrough.md](scripts/demo-walkthrough.md) for a five-minute
+narrated tour.
+
+## How it works
+
+Three planes, so model cost scales with the number of *suspects* rather than the
+number of *requests*:
+
+```
+request ──► client IP ──► tier lookup (in-memory) ──► token bucket ──► allow/deny
+                │                                         └──► observation [non-blocking]
+                │
+   every 10s ───┴──► aggregate ──► baseline ──► score ──► hard evidence ──► top-N suspects
+                                                                             │
+   async, bounded ─────────────────────────────────────────────────────────► judge
+                                                                             │
+                                              policy matrix ──► GUARDRAILS ──► tier store
+```
+
+- **The model is never in the request path.** Published latency (70–500 ms) and
+  rate limits (1,200 rpm) rule it out.
+- **The model never gets the final say.** Ten code-level guardrails decide what a
+  verdict may do; `block` needs enforce mode *and* deterministic hard evidence
+  *and* confidence above a floor.
+- **Escalation is slow.** One tier per cycle unless hard evidence is present, so
+  one confident-but-wrong verdict cannot slam the gate shut.
+- **The data plane keeps working when the judge does not.** Circuit breaker,
+  fallback judge, and no tier changes on a failing cycle.
+
+Full detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Enforcement tiers
+
+| Tier | Effect |
+|---|---|
+| `normal` | the configured rule applies |
+| `watch` | observed and counted; nothing enforced |
+| `throttle` | 25% of the capacity and rate |
+| `strict` | 5%; still has a path through |
+| `block` | refused immediately, storage never touched |
 
 ## Configuration
 
-Configuration can be provided via YAML file or environment variables.
+Copy `config.yaml.example` and edit, or set anything in the environment with the
+`PORTCULLIS_` prefix (`PORTCULLIS_SERVER_HTTP_PORT=8080`). The pre-rename
+`RATE_LIMITER_` prefix still works for one release and logs a deprecation
+warning.
 
-### Configuration File
-
-Copy `config.yaml.example` to `config.yaml` and modify as needed:
+The sections that matter most:
 
 ```yaml
 server:
-  http_port: 8080
-  grpc_port: 9090
-  read_timeout: 10s
-  write_timeout: 10s
-
-redis:
-  address: "localhost:6379"
-  password: ""
-  db: 0
-  pool_size: 10
-
+  trusted_proxies: ["10.0.0.0/8"]   # whose X-Forwarded-For is believed; empty trusts nobody
+admin:
+  tokens_env: PORTCULLIS_ADMIN_TOKENS
+storage:
+  backend: memory                    # memory | redis
+  on_storage_error: deny             # fail closed
 ratelimit:
-  key_prefix: "rl:"
-  ttl: 1h
-  default_rules:
-    - name: default
-      capacity: 100
-      refill_rate: 10
-      period: 1m
-
-metrics:
-  enabled: true
-  path: "/metrics"
-
-logging:
-  level: "info"
-  format: "json"
+  default_rule: { name: default, capacity: 100, refill_rate: 100, period: 1m }
+  rules:
+    login: { capacity: 10, refill_rate: 10, period: 1m }
+judgment:
+  mode: shadow                       # off | shadow | enforce
+  judge: typesafe                    # rules | typesafe | mock
+  policy:
+    l7_flood: [ { min_confidence: 0.8, tier: block }, { min_confidence: 0.6, tier: strict } ]
+  guardrails:
+    block_min_confidence: 0.9
+    block_requires_hard_evidence: true
 ```
 
-### Environment Variables
+Note that `refill_rate` is **tokens per `period`**: `refill_rate: 10, period: 1m`
+is ten per minute, and `capacity` is the burst.
 
-All configuration options can be set via environment variables with the prefix `RATE_LIMITER_`:
+## API
 
-```bash
-RATE_LIMITER_SERVER_HTTP_PORT=8080
-RATE_LIMITER_SERVER_GRPC_PORT=9090
-RATE_LIMITER_REDIS_ADDRESS=localhost:6379
-RATE_LIMITER_USE_REDIS=true
-```
+### Public
 
-## API Reference
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/check` | allow or deny a request (`identifier`, `resource`, `tokens`, optional `attributes`) |
+| `POST` | `/v1/report` | report the upstream status of a request you already made |
+| `GET` | `/health`, `/ready` | liveness and readiness |
+| `GET` | `/metrics` | Prometheus metrics |
 
-### HTTP REST API
+### Admin (bearer token from `PORTCULLIS_ADMIN_TOKENS`)
 
-#### Check Rate Limit
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/admin/tiers` | every active tier |
+| `PUT` | `/v1/admin/tiers/:identity` | set a manual tier (`{tier, ttl, reason}`) |
+| `DELETE` | `/v1/admin/tiers/:identity` | clear one tier |
+| `DELETE` | `/v1/admin/tiers?all=true` | clear all tiers (needs `X-Portcullis-Confirm: all`) |
+| `GET` | `/v1/admin/decisions` | audit trail (`limit`, `identity`, `label`) |
+| `GET`/`PUT` | `/v1/admin/config/mode` | read or change the judgment mode |
+| `GET`/`DELETE` | `/v1/status/:key`, `/v1/reset/:key` | pre-rename aliases, still authenticated |
 
-```bash
-POST /v1/check
-Content-Type: application/json
-
-{
-  "identifier": "user-123",
-  "resource": "api",
-  "tokens": 1
-}
-```
-
-Response:
-```json
-{
-  "allowed": true,
-  "limit": 100,
-  "remaining": 99,
-  "reset_at_unix": 1699999999,
-  "retry_after_seconds": 0
-}
-```
-
-#### Get Status
-
-```bash
-GET /v1/status/{identifier}?resource=api
-```
-
-#### Reset Limit
-
-```bash
-DELETE /v1/reset/{identifier}?resource=api
-```
-
-#### Health Check
-
-```bash
-GET /health    # Liveness check
-GET /ready     # Readiness check
-GET /metrics   # Prometheus metrics
-```
-
-### gRPC API
-
-The gRPC service is defined in `api/proto/ratelimiter.proto`:
-
-```protobuf
-service RateLimiterService {
-  rpc CheckRateLimit(CheckRequest) returns (CheckResponse);
-  rpc GetLimitStatus(StatusRequest) returns (StatusResponse);
-  rpc ResetLimit(ResetRequest) returns (ResetResponse);
-}
-```
-
-Use `grpcurl` for testing:
-
-```bash
-# Check rate limit
-grpcurl -plaintext -d '{"identifier":"user-123","resource":"api","tokens":1}' \
-  localhost:9090 ratelimiter.RateLimiterService/CheckRateLimit
-
-# Get status
-grpcurl -plaintext -d '{"identifier":"user-123"}' \
-  localhost:9090 ratelimiter.RateLimiterService/GetLimitStatus
-
-# Health check
-grpcurl -plaintext localhost:9090 grpc.health.v1.Health/Check
-```
-
-## Client Library
-
-Use the built-in Go client library:
-
-```go
-package main
-
-import (
-    "context"
-    "log"
-
-    "github.com/nshekhawat/rate-limiter-go/pkg/client"
-)
-
-func main() {
-    // HTTP Client
-    httpClient, _ := client.NewHTTPClient(&client.HTTPConfig{
-        BaseURL: "http://localhost:8080",
-    })
-    defer httpClient.Close()
-
-    // gRPC Client
-    grpcClient, _ := client.NewGRPCClient(&client.GRPCConfig{
-        Address: "localhost:9090",
-    })
-    defer grpcClient.Close()
-
-    ctx := context.Background()
-
-    // Check rate limit
-    decision, err := httpClient.Check(ctx, "user-123",
-        client.WithResource("api"),
-        client.WithTokens(1),
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    if decision.Allowed {
-        log.Println("Request allowed")
-    } else {
-        log.Printf("Rate limited. Retry after: %v", decision.RetryAfter)
-    }
-}
-```
-
-## HTTP Middleware
-
-Use as middleware in your Gin application:
-
-```go
-package main
-
-import (
-    "github.com/gin-gonic/gin"
-    "github.com/nshekhawat/rate-limiter-go/internal/middleware"
-    "github.com/nshekhawat/rate-limiter-go/internal/ratelimiter"
-    "github.com/nshekhawat/rate-limiter-go/internal/storage"
-)
-
-func main() {
-    store := storage.NewMemoryStorage(time.Hour)
-    limiter := ratelimiter.NewRateLimiter(store, nil, nil)
-
-    r := gin.Default()
-
-    // IP-based rate limiting
-    r.Use(middleware.IPBasedRateLimiter(limiter))
-
-    // Or API key based
-    r.Use(middleware.APIKeyRateLimiter(limiter, "X-API-Key"))
-
-    r.GET("/api/resource", func(c *gin.Context) {
-        c.JSON(200, gin.H{"status": "ok"})
-    })
-
-    r.Run(":8080")
-}
-```
-
-## Docker
-
-### Build Image
-
-```bash
-docker build -t rate-limiter:latest .
-```
-
-### Run Container
-
-```bash
-# With in-memory storage
-docker run -p 8080:8080 -p 9090:9090 rate-limiter:latest
-
-# With Redis
-docker run -p 8080:8080 -p 9090:9090 \
-  -e RATE_LIMITER_USE_REDIS=true \
-  -e RATE_LIMITER_REDIS_ADDRESS=host.docker.internal:6379 \
-  rate-limiter:latest
-```
-
-## Kubernetes Deployment
-
-```bash
-# Deploy to Kubernetes
-kubectl apply -k k8s/
-
-# Verify deployment
-kubectl get pods -l app=rate-limiter
-
-# Access the service
-kubectl port-forward svc/rate-limiter 8080:8080 9090:9090
-```
-
-The Kubernetes manifests include:
-- Deployment with 3 replicas
-- Horizontal Pod Autoscaler (3-10 replicas)
-- Pod Disruption Budget
-- ConfigMap for configuration
-- Service for load balancing
-- ServiceAccount
-- Redis deployment (for development)
+The gRPC service `portcullis.v1.RateLimiterService` mirrors `/v1/check` and
+`/v1/report`; `portcullis.v1.AdminService` mirrors the admin tier and decision
+API. gRPC server reflection is **off** by default.
 
 ## Metrics
 
-Prometheus metrics are exposed at `/metrics`:
+Namespace `portcullis_`. The judgment plane adds `judge_requests_total`,
+`judge_latency_seconds`, `verdicts_total{label,confidence_band}`,
+`tier_transitions_total`, `active_tiers`, `tier_denials_total`,
+`guardrail_trips_total`, `breaker_state`, `signals_dropped_total`,
+`tracked_identities`, `detection_cycle_seconds` and `suspects_selected_total`.
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `ratelimiter_http_requests_total` | Counter | Total HTTP requests |
-| `ratelimiter_http_request_duration_seconds` | Histogram | HTTP request duration |
-| `ratelimiter_ratelimit_allowed_total` | Counter | Allowed rate limit requests |
-| `ratelimiter_ratelimit_denied_total` | Counter | Denied rate limit requests |
-| `ratelimiter_tokens_consumed_total` | Counter | Total tokens consumed |
-| `ratelimiter_storage_operations_total` | Counter | Storage operations count |
-| `ratelimiter_storage_operation_duration_seconds` | Histogram | Storage operation duration |
-| `ratelimiter_grpc_requests_total` | Counter | Total gRPC requests |
-| `ratelimiter_grpc_request_duration_seconds` | Histogram | gRPC request duration |
+No label carries an identity, a path or a user agent, and the resource label is
+restricted to configured rule names plus `other`.
+
+## Operations
+
+Read [docs/OPERATIONS.md](docs/OPERATIONS.md) before enforcing anything. The
+short version:
+
+- Roll out in `shadow` for at least a week and compare decision records with
+  ground truth.
+- Storage errors fail closed by default.
+- Only bucketed features, evidence flags and ≤ 8 truncated sampled paths leave
+  the process; never an IP or an API key.
+- Budget caps are hard stops: ≤ 12 calls/min and a daily token ceiling.
+
+Measured performance: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Development
 
-### Run Tests
-
 ```bash
-# Run all tests
-go test ./...
-
-# Run with coverage
-go test -cover ./...
-
-# Run specific package tests
-go test -v ./internal/ratelimiter/...
+make ci             # build, go vet, golangci-lint, go test -race ./...
+make test-short     # unit tests only (skips the Redis integration tests)
+make e2e            # the end-to-end suite (build tag e2e)
+make bench          # benchmark smoke
+make proto          # regenerate from api/proto/portcullis/v1/portcullis.proto
 ```
 
-### Generate Proto Files
-
-```bash
-protoc --go_out=. --go_opt=paths=source_relative \
-  --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-  api/proto/ratelimiter.proto
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Client Applications                      │
-└─────────────┬───────────────────────────────────┬───────────┘
-              │                                   │
-              ▼                                   ▼
-       ┌──────────────┐                   ┌──────────────┐
-       │  HTTP API    │                   │  gRPC API    │
-       │  (Gin)       │                   │              │
-       └──────┬───────┘                   └──────┬───────┘
-              │                                   │
-              └─────────────┬─────────────────────┘
-                            │
-                            ▼
-                   ┌────────────────┐
-                   │  Rate Limiter  │
-                   │    Service     │
-                   └────────┬───────┘
-                            │
-                            ▼
-                   ┌────────────────┐
-                   │  Token Bucket  │
-                   │   Algorithm    │
-                   └────────┬───────┘
-                            │
-              ┌─────────────┴─────────────┐
-              │                           │
-              ▼                           ▼
-       ┌──────────────┐           ┌──────────────┐
-       │   Memory     │           │    Redis     │
-       │   Storage    │           │   Storage    │
-       └──────────────┘           └──────────────┘
-```
-
-## License
-
-MIT License - Free to use.
+The implementation follows [docs/SPEC.md](docs/SPEC.md), which records the
+design decisions, the bug list it closed, and what is still outstanding.

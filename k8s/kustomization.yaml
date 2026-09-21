@@ -10,10 +10,13 @@ resources:
   - pdb.yaml
   - redis.yaml
 
-commonLabels:
-  app.kubernetes.io/name: rate-limiter
-  app.kubernetes.io/component: rate-limiting
+labels:
+  - includeSelectors: true
+    pairs:
+      app.kubernetes.io/name: portcullis
+      app.kubernetes.io/component: rate-limiting
 
 images:
-  - name: rate-limiter
-    newTag: latest
+  - name: portcullis
+    newName: ghcr.io/nshekhawat/portcullis
+    newTag: 0.1.0

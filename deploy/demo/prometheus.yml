@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: portcullis-gateway-a
+    static_configs:
+      - targets: ["gateway-a:8081"]
+  - job_name: portcullis-gateway-b
+    static_configs:
+      - targets: ["gateway-b:8081"]

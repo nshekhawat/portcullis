@@ -1,55 +1,45 @@
-# Build stage
-FROM golang:1.23-alpine AS builder
+# syntax=docker/dockerfile:1
 
-# Install build dependencies
+# Build stage. The official image sets GOTOOLCHAIN=local, so the base tag must
+# satisfy the go directive in go.mod (see spec §3.4 / B15).
+FROM golang:1.27-alpine AS builder
+
+ARG VERSION=dev
+ARG COMMIT=none
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
 RUN apk add --no-cache git ca-certificates
 
-WORKDIR /app
+WORKDIR /src
 
-# Copy go mod files
 COPY go.mod go.sum ./
-
-# Download dependencies
 RUN go mod download
 
-# Copy source code
 COPY . .
 
-# Build the binary
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-    -ldflags="-w -s" \
-    -o /app/ratelimiter \
-    ./cmd/ratelimiter
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -trimpath \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
+    -o /out/portcullis \
+    ./cmd/portcullis
 
-# Final stage
-FROM alpine:3.19
+# Final stage: distroless static, no shell.
+FROM gcr.io/distroless/static-debian12:nonroot
 
-# Install ca-certificates for HTTPS connections
-RUN apk --no-cache add ca-certificates tzdata
+COPY --from=builder /out/portcullis /usr/local/bin/portcullis
 
-# Create non-root user
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+# Default configuration. The binary searches /etc/portcullis, so the container
+# starts with the shipped defaults without any mounting.
+COPY config.yaml.example /etc/portcullis/config.yaml
 
-WORKDIR /app
+USER nonroot:nonroot
 
-# Copy binary from builder
-COPY --from=builder /app/ratelimiter .
+EXPOSE 8080 9090 8081
 
-# Copy default config
-COPY config.yaml.example ./config.yaml
-
-# Change ownership
-RUN chown -R appuser:appgroup /app
-
-# Switch to non-root user
-USER appuser
-
-# Expose ports
-EXPOSE 8080 9090
-
-# Health check
+# distroless has no shell, so the healthcheck runs the subcommand directly.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+    CMD ["/usr/local/bin/portcullis", "healthcheck", "--url", "http://127.0.0.1:8080/health"]
 
-# Run the binary
-ENTRYPOINT ["/app/ratelimiter"]
+ENTRYPOINT ["/usr/local/bin/portcullis"]
+CMD ["serve"]

@@ -11,7 +11,7 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/nshekhawat/rate-limiter-go
+        - github.com/nshekhawat/portcullis
 
 linters:
   default: none

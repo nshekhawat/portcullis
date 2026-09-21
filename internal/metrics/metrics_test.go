@@ -3,14 +3,17 @@ package metrics
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/nshekhawat/rate-limiter-go/internal/storage"
+	"github.com/nshekhawat/portcullis/internal/ratelimiter"
+	"github.com/nshekhawat/portcullis/internal/storage"
 )
 
 func newTestMetrics() *Metrics {
@@ -62,13 +65,13 @@ func newTestMetrics() *Metrics {
 			[]string{"identifier_type", "resource"},
 		),
 
-		TokensRemaining: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
+		RateLimitStorageFailures: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
 				Namespace: "test",
-				Name:      "tokens_remaining",
-				Help:      "Current tokens remaining in buckets",
+				Name:      "ratelimit_storage_failures_total",
+				Help:      "Denied rate limit requests caused by the storage layer, by reason",
 			},
-			[]string{"identifier", "resource"},
+			[]string{"reason"},
 		),
 
 		StorageOperations: prometheus.NewCounterVec(
@@ -126,6 +129,45 @@ func newTestMetrics() *Metrics {
 			},
 			[]string{"method"},
 		),
+
+		JudgeRequests: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Namespace: "test", Name: "judge_requests_total"},
+			[]string{"judge", "outcome"},
+		),
+		JudgeLatency: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{Namespace: "test", Name: "judge_latency_seconds"},
+			[]string{"judge"},
+		),
+		JudgeSuspects:    prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "test", Name: "judge_suspects_per_call"}),
+		JudgeInputTokens: prometheus.NewCounter(prometheus.CounterOpts{Namespace: "test", Name: "judge_input_tokens_total"}),
+		Verdicts: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Namespace: "test", Name: "verdicts_total"},
+			[]string{"label", "confidence_band"},
+		),
+		TierTransitions: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Namespace: "test", Name: "tier_transitions_total"},
+			[]string{"from", "to", "source"},
+		),
+		ActiveTiers: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{Namespace: "test", Name: "active_tiers"},
+			[]string{"tier"},
+		),
+		TierDenials: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Namespace: "test", Name: "tier_denials_total"},
+			[]string{"tier"},
+		),
+		GuardrailTrips: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Namespace: "test", Name: "guardrail_trips_total"},
+			[]string{"guardrail"},
+		),
+		BreakerState: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{Namespace: "test", Name: "breaker_state"},
+			[]string{"judge"},
+		),
+		SignalsDropped:    prometheus.NewCounter(prometheus.CounterOpts{Namespace: "test", Name: "signals_dropped_total"}),
+		TrackedIdentities: prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "test", Name: "tracked_identities"}),
+		DetectionCycle:    prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: "test", Name: "detection_cycle_seconds"}),
+		SuspectsSelected:  prometheus.NewCounter(prometheus.CounterOpts{Namespace: "test", Name: "suspects_selected_total"}),
 	}
 }
 
@@ -170,18 +212,62 @@ func TestMetrics_RecordRateLimitDecision(t *testing.T) {
 	assert.Equal(t, float64(3), tokens)
 }
 
-func TestMetrics_RecordTokensRemaining(t *testing.T) {
+// TestMetrics_DecisionCountersIncrement covers B14: the limiter's decisions
+// must actually reach the allowed/denied/token counters.
+func TestMetrics_DecisionCountersIncrement(t *testing.T) {
 	m := newTestMetrics()
+	recorder := NewDecisionRecorder(m, "login", "default")
 
-	m.RecordTokensRemaining("user1", "api", 8.5)
+	recorder.ObserveDecision(ratelimiter.Observation{
+		Allowed: true, IdentifierType: "ip", Resource: "login", Tokens: 2,
+	})
+	recorder.ObserveDecision(ratelimiter.Observation{
+		Allowed: false, IdentifierType: "ip", Resource: "login", Tokens: 1, Reason: ratelimiter.ReasonLimit,
+	})
+	recorder.ObserveDecision(ratelimiter.Observation{
+		Allowed: false, IdentifierType: "identifier", Resource: "/admin/secret", Tokens: 1, Reason: ratelimiter.ReasonLimit,
+	})
+	recorder.ObserveDecision(ratelimiter.Observation{
+		Allowed: false, IdentifierType: "ip", Resource: "default", Tokens: 1, Reason: ratelimiter.ReasonCapacity,
+	})
 
-	remaining := testutil.ToFloat64(m.TokensRemaining.WithLabelValues("user1", "api"))
-	assert.Equal(t, 8.5, remaining)
+	assert.Equal(t, float64(1), testutil.ToFloat64(m.RateLimitAllowed.WithLabelValues("ip", "login")))
+	assert.Equal(t, float64(1), testutil.ToFloat64(m.RateLimitDenied.WithLabelValues("ip", "login")))
+	assert.Equal(t, float64(2), testutil.ToFloat64(m.TokensConsumed.WithLabelValues("ip", "login")))
 
-	// Update value
-	m.RecordTokensRemaining("user1", "api", 5.0)
-	remaining = testutil.ToFloat64(m.TokensRemaining.WithLabelValues("user1", "api"))
-	assert.Equal(t, 5.0, remaining)
+	// A resource outside the configured rules is bucketed as "other", so an
+	// attacker cannot mint a metric series per path.
+	assert.Equal(t, float64(1), testutil.ToFloat64(m.RateLimitDenied.WithLabelValues("identifier", "other")))
+
+	assert.Equal(t, float64(1), testutil.ToFloat64(m.RateLimitStorageFailures.WithLabelValues("capacity")))
+	assert.Equal(t, float64(0), testutil.ToFloat64(m.RateLimitStorageFailures.WithLabelValues("storage_error")))
+}
+
+// TestMetrics_NoIdentifierLabel covers B14: no label may carry an identity.
+func TestMetrics_NoIdentifierLabel(t *testing.T) {
+	forbidden := map[string]bool{
+		"identifier": true,
+		"identity":   true,
+		"ip":         true,
+		"api_key":    true,
+		"key":        true,
+		"user_agent": true,
+	}
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+
+	for _, family := range families {
+		if !strings.HasPrefix(family.GetName(), "portcullis_") {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				assert.False(t, forbidden[label.GetName()],
+					"metric %s exposes identity-bearing label %q", family.GetName(), label.GetName())
+			}
+		}
+	}
 }
 
 func TestMetrics_RecordStorageOperation(t *testing.T) {
@@ -221,13 +307,13 @@ func TestMetrics_RecordStoragePoolStats(t *testing.T) {
 func TestMetrics_RecordGRPCRequest(t *testing.T) {
 	m := newTestMetrics()
 
-	m.RecordGRPCRequest("/ratelimiter.RateLimiterService/CheckRateLimit", "OK", 0.001)
-	m.RecordGRPCRequest("/ratelimiter.RateLimiterService/CheckRateLimit", "ResourceExhausted", 0.002)
+	m.RecordGRPCRequest("/portcullis.v1.RateLimiterService/CheckRateLimit", "OK", 0.001)
+	m.RecordGRPCRequest("/portcullis.v1.RateLimiterService/CheckRateLimit", "ResourceExhausted", 0.002)
 
-	ok := testutil.ToFloat64(m.GRPCRequestsTotal.WithLabelValues("/ratelimiter.RateLimiterService/CheckRateLimit", "OK"))
+	ok := testutil.ToFloat64(m.GRPCRequestsTotal.WithLabelValues("/portcullis.v1.RateLimiterService/CheckRateLimit", "OK"))
 	assert.Equal(t, float64(1), ok)
 
-	exhausted := testutil.ToFloat64(m.GRPCRequestsTotal.WithLabelValues("/ratelimiter.RateLimiterService/CheckRateLimit", "ResourceExhausted"))
+	exhausted := testutil.ToFloat64(m.GRPCRequestsTotal.WithLabelValues("/portcullis.v1.RateLimiterService/CheckRateLimit", "ResourceExhausted"))
 	assert.Equal(t, float64(1), exhausted)
 }
 
