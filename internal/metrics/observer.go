@@ -1,6 +1,9 @@
 package metrics
 
-import "github.com/nshekhawat/portcullis/internal/ratelimiter"
+import (
+	"github.com/nshekhawat/portcullis/internal/policy"
+	"github.com/nshekhawat/portcullis/internal/ratelimiter"
+)
 
 // otherResource is the label used for resources outside the configured rule
 // names. Keeping the label set closed stops an attacker from minting metric
@@ -41,9 +44,13 @@ func (d *DecisionRecorder) ObserveDecision(o ratelimiter.Observation) {
 		return
 	}
 
-	// A blocked request is refused by the tier, not by the bucket: that is the
-	// tier_denials_total series.
-	if o.Reason == ratelimiter.ReasonBlocked {
+	// A denial for an identity holding a non-normal tier is attributable to
+	// that tier, whether the tier refused outright (ReasonBlocked) or its
+	// scaled-down bucket simply ran dry (ReasonLimit). A storage failure is
+	// not: it would have denied the request whatever tier the identity held,
+	// and it is already counted as a storage failure below.
+	if o.Tier > policy.TierNormal &&
+		(o.Reason == ratelimiter.ReasonBlocked || o.Reason == ratelimiter.ReasonLimit) {
 		d.metrics.TierDenials.WithLabelValues(o.Tier.String()).Inc()
 	}
 

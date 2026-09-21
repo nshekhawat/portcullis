@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -173,11 +174,20 @@ func buildPlane(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*p
 	}, nil
 }
 
+// tierPruneInterval is how often an in-memory tier store sweeps expired
+// entries out of its maps. Lookup and List already filter expired entries
+// from what they return; without a sweep, an identity that keeps getting
+// escalated under a rotating address grows the store without bound (H2).
+const tierPruneInterval = time.Minute
+
 // buildTierStore creates the tier store, using Redis when the bucket backend is
 // Redis so replicas share one tier table.
 func buildTierStore(ctx context.Context, cfg *config.Config, logger *zap.Logger) (store policy.TierStore, closeFn func(), err error) {
 	if cfg.Storage.Backend != config.BackendRedis {
-		return policy.NewMemoryStore(clock.System()), nil, nil
+		memStore := policy.NewMemoryStore(clock.System())
+		pruneCtx, cancel := context.WithCancel(context.Background())
+		memStore.StartPruning(pruneCtx, tierPruneInterval)
+		return memStore, cancel, nil
 	}
 
 	client := redis.NewClient(&redis.Options{
@@ -239,8 +249,17 @@ func buildGuardrails(cfg config.JudgmentConfig) (controller.Guardrails, error) {
 			guardrails.Allowlist = append(guardrails.Allowlist, prefixes[0])
 			continue
 		}
-		// Anything that is not an address is an exact identity (an API key, a
-		// service name, a prefix window).
+		// An entry containing "/" was written as a CIDR and failed to parse
+		// (a typo: an out-of-range octet, a bit count past the address
+		// length). Silently reinterpreting it as an exact-identity match
+		// would allowlist a string that can never equal a real identity — a
+		// permanent no-op with no error. Since this is the "never escalated"
+		// list, that fails loudly instead (L4).
+		if strings.Contains(entry, "/") {
+			return controller.Guardrails{}, fmt.Errorf("judgment guardrails.allowlist: %q looks like a CIDR but does not parse: %w", entry, err)
+		}
+		// Anything else that is not an address is an exact identity (an API
+		// key, a service name, a prefix window).
 		guardrails.AllowlistIdentities[entry] = true
 	}
 
@@ -256,9 +275,15 @@ func buildJudge(cfg *config.Config, logger *zap.Logger) (judge.Judge, error) {
 	case config.JudgeTypeSafe:
 		apiKey := os.Getenv(cfg.Judgment.TypeSafe.APIKeyEnv)
 		if apiKey == "" {
-			logger.Warn("no API key set for the typesafe judge; falling back to the rules judge",
-				zap.String("env", cfg.Judgment.TypeSafe.APIKeyEnv))
-			return rules.New(), nil
+			// Fail startup rather than quietly downgrading to the rules judge
+			// (M6): judgment.policy is tuned against the pinned model (spec
+			// §9), so a silent substitution would run tuned thresholds against
+			// an untuned judge while the process reports healthy. An operator
+			// who wants the rules judge should configure it, not get it by
+			// accident.
+			return nil, fmt.Errorf(
+				"judgment.judge is %q but %s is not set: refusing to silently fall back to the rules judge",
+				config.JudgeTypeSafe, cfg.Judgment.TypeSafe.APIKeyEnv)
 		}
 		return typesafe.New(typesafe.Options{
 			BaseURL:          cfg.Judgment.TypeSafe.BaseURL,
@@ -287,7 +312,14 @@ func buildFallbackJudge(cfg *config.Config, logger *zap.Logger) (judge.Judge, er
 	case config.JudgeTypeSafe:
 		apiKey := os.Getenv(cfg.Judgment.TypeSafe.APIKeyEnv)
 		if apiKey == "" {
-			return nil, nil
+			// Same reasoning as the primary judge (M6): a fallback that
+			// silently becomes "no fallback" is not a safe default, because
+			// the controller reads a nil fallback as "no judge available" and
+			// skips cycles entirely once the breaker opens. An operator who
+			// wants no fallback should leave fallback_judge empty, not set
+			// typesafe without a key.
+			return nil, fmt.Errorf(
+				"judgment.fallback_judge is %q but %s is not set", config.JudgeTypeSafe, cfg.Judgment.TypeSafe.APIKeyEnv)
 		}
 		return typesafe.New(typesafe.Options{
 			BaseURL: cfg.Judgment.TypeSafe.BaseURL,

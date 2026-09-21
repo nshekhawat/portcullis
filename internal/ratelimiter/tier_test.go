@@ -205,3 +205,68 @@ func TestTierNeverTouchesStorageForBlock(t *testing.T) {
 	}
 	assert.Zero(t, store.consumeCalls.Load())
 }
+
+// recordingObserver captures every Observation a limiter hands it.
+type recordingObserver struct {
+	observations []Observation
+}
+
+func (r *recordingObserver) ObserveDecision(o Observation) {
+	r.observations = append(r.observations, o)
+}
+
+// TestObservation_CarriesTier is the regression for H3: the metrics observer
+// must see the tier that actually applied, not the zero value. Without it,
+// tier_denials_total is always labeled "normal" no matter which tier denied
+// the request.
+func TestObservation_CarriesTier(t *testing.T) {
+	store := storage.NewMemoryStorage(time.Minute)
+	defer store.Close()
+	tiers := policy.NewMemoryStore(nil)
+	ctx := context.Background()
+
+	require.NoError(t, tiers.Set(ctx, "1.2.3.4", policy.TierEntry{
+		Tier: policy.TierBlock, Until: time.Now().Add(time.Hour), Source: "judge:rules",
+	}))
+
+	obs := &recordingObserver{}
+	rl := NewRateLimiter(store, &Config{
+		KeyPrefix:   "test:",
+		DefaultRule: &Rule{Name: "default", Capacity: 10, RefillRate: 10, Period: time.Second},
+		Tiers:       tiers,
+		TierConfigs: tierConfigs(),
+		Observer:    obs,
+	}, nil)
+
+	decision, err := rl.AllowN(ctx, "1.2.3.4", "", 1)
+	require.NoError(t, err)
+	require.False(t, decision.Allowed)
+	require.Equal(t, policy.TierBlock, decision.Tier)
+
+	require.Len(t, obs.observations, 1)
+	assert.Equal(t, policy.TierBlock, obs.observations[0].Tier)
+	assert.Equal(t, ReasonBlocked, obs.observations[0].Reason)
+}
+
+// TestObservation_NormalTierWhenUntiered checks the non-regression case: an
+// identity with no tier entry still reports TierNormal, so the metric label
+// set stays meaningful.
+func TestObservation_NormalTierWhenUntiered(t *testing.T) {
+	store := storage.NewMemoryStorage(time.Minute)
+	defer store.Close()
+	tiers := policy.NewMemoryStore(nil)
+
+	obs := &recordingObserver{}
+	rl := NewRateLimiter(store, &Config{
+		KeyPrefix:   "test:",
+		DefaultRule: &Rule{Name: "default", Capacity: 10, RefillRate: 10, Period: time.Second},
+		Tiers:       tiers,
+		TierConfigs: tierConfigs(),
+		Observer:    obs,
+	}, nil)
+
+	_, err := rl.AllowN(context.Background(), "5.6.7.8", "", 1)
+	require.NoError(t, err)
+	require.Len(t, obs.observations, 1)
+	assert.Equal(t, policy.TierNormal, obs.observations[0].Tier)
+}

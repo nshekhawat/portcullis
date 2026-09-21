@@ -633,6 +633,13 @@ func (s *HTTPServer) setTierHandler(c *gin.Context) {
 	}
 
 	identity := c.Param("identity")
+	// The check path bounds identifier length (ValidateKey, B20); this path
+	// took the identity from the URL unvalidated and wrote it straight into
+	// the shared tier store (Redis, in a real deployment) (L8).
+	if err := ratelimiter.ValidateKey(identity, ""); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	ttl := manualTTL(requested, tierTTL(s.config.TierConfigs, tier), s.config.MaxTTL)
 	entry := policy.TierEntry{
 		Tier:   tier,

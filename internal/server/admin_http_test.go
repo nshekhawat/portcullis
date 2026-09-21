@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/nshekhawat/portcullis/internal/controller"
 	"github.com/nshekhawat/portcullis/internal/judge"
 	"github.com/nshekhawat/portcullis/internal/policy"
+	"github.com/nshekhawat/portcullis/internal/ratelimiter"
 	"github.com/nshekhawat/portcullis/internal/signals"
 	"github.com/nshekhawat/portcullis/internal/storage"
 )
@@ -182,6 +184,21 @@ func TestAdminTiers_CRUD(t *testing.T) {
 			"ttl":  "soon",
 		})
 		assert.Equal(t, http.StatusBadRequest, w.Code)
+	})
+
+	// L8: setTierHandler took c.Param("identity") unvalidated and wrote it
+	// straight into the tier store, unlike the check path (ValidateKey,
+	// B20). An over-long identity would be admitted into the shared store
+	// (Redis, in a real deployment) with no bound.
+	t.Run("an over-long identity is rejected", func(t *testing.T) {
+		tooLong := strings.Repeat("a", ratelimiter.MaxIdentifierLength+1)
+		w := adminJSON(t, server, http.MethodPut, "/v1/admin/tiers/"+tooLong, map[string]string{
+			"tier": "watch",
+		})
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+
+		_, ok := tiers.Lookup(tooLong, time.Now())
+		assert.False(t, ok, "a rejected identity must not be stored")
 	})
 }
 

@@ -92,3 +92,14 @@ type Judge interface {
 	// detection.max_suspects.
 	Judge(ctx context.Context, suspects []detect.Suspect) ([]Verdict, error)
 }
+
+// UsageReporter is an optional capability of a Judge that tracks the input
+// tokens its most recent Judge call consumed, such as the typesafe judge. The
+// controller charges the reported value against the daily budget and the
+// judge_input_tokens_total metric (spec §5.6, §9). A judge that has no notion
+// of tokens, such as the rules or mock judges, simply does not implement it.
+type UsageReporter interface {
+	// InputTokens returns the input tokens consumed by the most recent Judge
+	// call, summed across however many requests that call split into.
+	InputTokens() int64
+}

@@ -165,14 +165,25 @@ func (s *RedisStore) Resync(ctx context.Context) error {
 	return nil
 }
 
-// readAll loads the hash from Redis.
+// readAll loads the hash from Redis, filtering to entries that are still
+// active and reaping (HDel) the ones that have expired.
+//
+// Without this, an expired entry stays in the hash forever: it is only ever
+// removed by an explicit Delete, so an attacker rotating through identities
+// (exactly the traffic this store exists to escalate against) grows the hash
+// without bound, and every replica's periodic Resync copies the whole,
+// ever-growing thing (H2). Reaping here, rather than in a separate sweep,
+// costs nothing extra: readAll already walks every field on every List call
+// and on every resync tick.
 func (s *RedisStore) readAll(ctx context.Context) (map[string]TierEntry, error) {
 	fields, err := s.client.HGetAll(ctx, s.opts.Key).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read tier hash: %w", err)
 	}
 
+	now := s.opts.Clock.Now()
 	entries := make(map[string]TierEntry, len(fields))
+	var expired map[string]string
 	for identity, raw := range fields {
 		var entry TierEntry
 		if err := json.Unmarshal([]byte(raw), &entry); err != nil {
@@ -181,9 +192,76 @@ func (s *RedisStore) readAll(ctx context.Context) (map[string]TierEntry, error) 
 			)
 			continue
 		}
+		if !entry.Active(now) {
+			// Keep the exact bytes read: the reap deletes the field only while
+			// it still holds them.
+			if expired == nil {
+				expired = make(map[string]string)
+			}
+			expired[identity] = raw
+			continue
+		}
 		entries[identity] = entry
 	}
+
+	s.reapExpired(ctx, expired)
+
 	return entries, nil
+}
+
+// reapExpiredScript deletes hash fields, but only while each still holds the
+// exact value the caller read. It is the Redis equivalent of
+// sync.Map.CompareAndDelete, and it exists for the same reason the memory
+// backend needed that call (B6).
+var reapExpiredScript = redis.NewScript(`
+local deleted = 0
+for i = 1, #ARGV, 2 do
+  if redis.call('HGET', KEYS[1], ARGV[i]) == ARGV[i+1] then
+    redis.call('HDEL', KEYS[1], ARGV[i])
+    deleted = deleted + 1
+  end
+end
+return deleted
+`)
+
+// reapBatchSize bounds how many fields one reap script touches. Redis runs
+// scripts on its single thread, so a sweep after a long outage — when tens of
+// thousands of entries can expire together — is split rather than parked on
+// the server in one call.
+const reapBatchSize = 512
+
+// reapExpired removes expired fields from the tier hash.
+//
+// stale maps each identity to the exact value readAll saw. A field is deleted
+// only while it still holds that value: between the HGETALL that found it
+// expired and this delete, another replica may have re-escalated the same
+// identity, and dropping that fresh entry would hand an active abuser its
+// full quota back. Failures are not fatal — the entries are already excluded
+// from what readAll returns, and the next sweep tries again.
+func (s *RedisStore) reapExpired(ctx context.Context, stale map[string]string) {
+	if len(stale) == 0 {
+		return
+	}
+
+	argv := make([]any, 0, min(len(stale), reapBatchSize)*2)
+	flush := func() {
+		if len(argv) == 0 {
+			return
+		}
+		err := reapExpiredScript.Run(ctx, s.client, []string{s.opts.Key}, argv...).Err()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			s.opts.Logger.Warn("failed to reap expired tier entries", zap.Error(err))
+		}
+		argv = argv[:0]
+	}
+
+	for identity, raw := range stale {
+		argv = append(argv, identity, raw)
+		if len(argv) >= reapBatchSize*2 {
+			flush()
+		}
+	}
+	flush()
 }
 
 // listen applies pub/sub events to the mirror.

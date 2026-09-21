@@ -3,6 +3,7 @@ package ratelimiter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -610,6 +611,69 @@ func BenchmarkRateLimiter_Allow(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		rl.Allow(ctx, "user1")
 	}
+}
+
+// TestGetRule_ConcurrentFirstUseHasNoRace is the regression for L9:
+// getRule and AllowWithRule used to call rule.Normalize() on the shared
+// *Rule from config.Rules on every request, mutating it in place. The
+// DefaultRule is normalized once in NewRateLimiter before requests start, but
+// a named rule in config.Rules is normalized lazily on first use, so its
+// first concurrent hits raced on r.Period. RatePerSecond already falls back
+// to a one-second period on its own when Period is zero, so the mutation was
+// never load-bearing; the fix simply stops writing to shared config from the
+// hot path. Run with -race.
+func TestGetRule_ConcurrentFirstUseHasNoRace(t *testing.T) {
+	store := storage.NewMemoryStorage(time.Minute)
+	defer store.Close()
+
+	config := &Config{
+		KeyPrefix:   "race:",
+		DefaultRule: &Rule{Name: "default", Capacity: 1000, RefillRate: 1000, Period: time.Second},
+		Rules: map[string]*Rule{
+			// Period is deliberately left at its zero value: this is the rule
+			// getRule normalizes lazily, on whichever goroutine reaches it
+			// first.
+			"shared": {Name: "shared", Capacity: 1000, RefillRate: 1000},
+		},
+		TTL: time.Hour,
+	}
+	rl := NewRateLimiter(store, config, nil)
+
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			_, err := rl.AllowN(context.Background(), fmt.Sprintf("id-%d", n), "shared", 1)
+			assert.NoError(t, err)
+		}(i)
+	}
+	wg.Wait()
+}
+
+// TestNewRateLimiter_NilRuleInMap checks the up-front normalization added for
+// L9 tolerates a nil entry in config.Rules, which the request path already
+// tolerated: getRule returns it and AllowWithRule falls back to the default
+// rule. Normalizing the map at construction must not turn that into a
+// startup panic.
+func TestNewRateLimiter_NilRuleInMap(t *testing.T) {
+	store := storage.NewMemoryStorage(time.Minute)
+	defer store.Close()
+
+	config := &Config{
+		KeyPrefix:   "nil:",
+		DefaultRule: &Rule{Name: "default", Capacity: 10, RefillRate: 10, Period: time.Second},
+		Rules:       map[string]*Rule{"broken": nil},
+		TTL:         time.Hour,
+	}
+
+	require.NotPanics(t, func() {
+		rl := NewRateLimiter(store, config, nil)
+		decision, err := rl.AllowN(context.Background(), "user1", "broken", 1)
+		require.NoError(t, err)
+		assert.True(t, decision.Allowed)
+		assert.Equal(t, int64(10), decision.Limit, "a nil rule falls back to the default rule")
+	})
 }
 
 func BenchmarkRateLimiter_Allow_Parallel(b *testing.B) {

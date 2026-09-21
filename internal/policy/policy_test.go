@@ -147,6 +147,57 @@ func TestMemoryStore_DeleteListPrune(t *testing.T) {
 	require.NoError(t, store.Delete(ctx, "b"))
 }
 
+// TestMemoryStore_StartPruning is the regression for H2: without a background
+// pruning loop, the memory tier store keeps every entry it has ever held,
+// including expired ones, until an operator issues an explicit Delete. Lookup
+// and List both already filter expired entries out of what they return, but
+// nothing before this shrank the underlying map, so an attacker who keeps
+// getting escalated under a rotating identity — the traffic this store exists
+// to act on — grew it without bound.
+func TestMemoryStore_StartPruning(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC))
+	store := NewMemoryStore(clk)
+	ctx := context.Background()
+
+	require.NoError(t, store.Set(ctx, "a", TierEntry{Tier: TierWatch, Until: clk.Now().Add(time.Minute)}))
+	require.NoError(t, store.Set(ctx, "b", TierEntry{Tier: TierBlock, Until: clk.Now().Add(time.Hour)}))
+	require.Equal(t, 2, store.Len())
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store.StartPruning(runCtx, 5*time.Millisecond)
+
+	clk.Advance(2 * time.Minute)
+
+	require.Eventually(t, func() bool {
+		return store.Len() == 1
+	}, time.Second, 5*time.Millisecond,
+		"the pruning loop must remove the expired entry on its own, without an explicit Delete or List call")
+
+	_, ok := store.Lookup("b", clk.Now())
+	assert.True(t, ok, "the still-live entry must survive pruning")
+}
+
+// TestMemoryStore_StartPruning_StopsOnContextCancel checks that the pruning
+// goroutine does not leak past the caller's context.
+func TestMemoryStore_StartPruning_StopsOnContextCancel(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC))
+	store := NewMemoryStore(clk)
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	store.StartPruning(runCtx, 5*time.Millisecond)
+	cancel()
+
+	// Give the goroutine a moment to observe cancellation, then confirm a
+	// later Set is not undone by a loop that kept running.
+	time.Sleep(20 * time.Millisecond)
+	require.NoError(t, store.Set(context.Background(), "late", TierEntry{
+		Tier: TierWatch, Until: clk.Now().Add(-time.Minute), // already expired
+	}))
+	time.Sleep(20 * time.Millisecond)
+	assert.Equal(t, 1, store.Len(), "a stopped pruning loop must not still be removing entries")
+}
+
 // TestTierLookup_NoAllocs guards the data plane budget: the hot path must not
 // allocate (spec §5.9).
 func TestTierLookup_NoAllocs(t *testing.T) {

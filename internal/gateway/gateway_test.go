@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -95,6 +96,7 @@ func newGatewayFixture(t *testing.T, configure func(*Config)) *gatewayFixture {
 	cfg.TrustedProxies = trusted
 	cfg.Signals = recorder
 	cfg.Routes = []Route{{Prefix: "/login", Rule: "login"}}
+	cfg.Store = store
 
 	limiterCfg := &ratelimiter.Config{
 		KeyPrefix:   "gw:",
@@ -277,6 +279,85 @@ func TestProxy_AdminPortNotProxied(t *testing.T) {
 	f.gw.AdminHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/index", nil))
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 	assert.Equal(t, before, f.upstreamHits(), "the admin listener never reaches the upstream")
+}
+
+// pingStorageStub implements storage.Storage but only Ping is meaningful; the
+// gateway's other routes never touch it.
+type pingStorageStub struct {
+	storage.Storage
+	err error
+}
+
+func (s pingStorageStub) Ping(context.Context) error { return s.err }
+
+// TestStart_ShutsDownBothListenersOnEitherError is the regression for L7: if
+// one listener fails to bind, Start must shut the other one down too before
+// returning, rather than leaving it running in the background holding its
+// port. A caller that treats a Start error as fatal (as cmd/portcullis does)
+// otherwise leaks the listener for the lifetime of the process.
+func TestStart_ShutsDownBothListenersOnEitherError(t *testing.T) {
+	f := newGatewayFixture(t, nil)
+
+	// Occupy an address so the admin listener fails to bind immediately.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer occupied.Close()
+
+	// Reserve a free port for the proxy listener, then release it so the
+	// gateway can bind it.
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	proxyAddr := proxyLn.Addr().String()
+	require.NoError(t, proxyLn.Close())
+
+	f.gw.server.Addr = proxyAddr
+	f.gw.adminServer.Addr = occupied.Addr().String()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- f.gw.Start() }()
+
+	select {
+	case startErr := <-errCh:
+		require.Error(t, startErr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not return")
+	}
+
+	require.Eventually(t, func() bool {
+		ln, err := net.Listen("tcp", proxyAddr)
+		if err != nil {
+			return false
+		}
+		_ = ln.Close()
+		return true
+	}, time.Second, 10*time.Millisecond,
+		"the proxy listener must be released once Start returns, not leaked in the background")
+}
+
+// TestReady_UsesStorePing is the regression for L1: the gateway's /ready must
+// reflect storage health (B19), not a limiter lookup against memory storage
+// that can never fail. Before the fix, gateway readiness was a constant 200
+// regardless of whether the backing store was reachable.
+func TestReady_UsesStorePing(t *testing.T) {
+	t.Run("unhealthy storage returns 503", func(t *testing.T) {
+		f := newGatewayFixture(t, func(c *Config) {
+			c.Store = pingStorageStub{err: assert.AnError}
+		})
+
+		rec := httptest.NewRecorder()
+		f.gw.AdminHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ready", nil))
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	})
+
+	t.Run("healthy storage returns 200", func(t *testing.T) {
+		f := newGatewayFixture(t, func(c *Config) {
+			c.Store = pingStorageStub{}
+		})
+
+		rec := httptest.NewRecorder()
+		f.gw.AdminHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ready", nil))
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
 }
 
 // TestProxy_RegisterAdminMountsTheAdminAPI checks the hook main uses to share

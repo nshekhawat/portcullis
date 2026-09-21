@@ -117,10 +117,14 @@ func (c *Controller) SetMode(mode Mode) error {
 }
 
 // Run executes cycles until the context is canceled.
+//
+// The ticker keeps running even when the mode is "off": Cycle is a no-op in
+// that mode, but the loop must still be alive so that an operator flipping
+// the mode at runtime (PUT /v1/admin/config/mode) takes effect on the next
+// tick instead of requiring a process restart (M4).
 func (c *Controller) Run(ctx context.Context) {
 	if c.Mode() == ModeOff {
-		c.opts.Logger.Info("judgment plane disabled")
-		return
+		c.opts.Logger.Info("judgment plane starting in off mode; cycles begin once the mode changes")
 	}
 
 	ticker := time.NewTicker(c.opts.Interval)
@@ -138,8 +142,23 @@ func (c *Controller) Run(ctx context.Context) {
 
 // Cycle runs one detection-to-judgment cycle and returns the decisions it
 // audited. It never returns an error: a failing judge is fail-static by design.
+//
+// Cycle is not safe for concurrent use: newBlocksThisCycle and decisionSeq are
+// plain fields, updated without synchronization, on the assumption that one
+// cycle runs to completion before the next starts. Run's ticker loop upholds
+// that by construction (it never starts a new tick while the previous one is
+// still in Cycle). A caller driving Cycle directly, such as a test or an
+// admin "run one cycle now" endpoint, must do the same: never call it from
+// more than one goroutine at a time, and never overlap it with Run.
 func (c *Controller) Cycle(ctx context.Context) []DecisionRecord {
-	if c.Mode() == ModeOff {
+	// The mode is captured once, here, and threaded through the rest of the
+	// cycle explicitly. Reading c.Mode() again later would let an operator's
+	// mid-cycle SetMode call apply to some verdicts in a batch and not others,
+	// and would make a DecisionRecord report whatever the mode happens to be
+	// when it is built rather than the mode that was actually in force for it
+	// (M1).
+	mode := c.Mode()
+	if mode == ModeOff {
 		return nil
 	}
 
@@ -184,11 +203,17 @@ func (c *Controller) Cycle(ctx context.Context) []DecisionRecord {
 		return nil
 	}
 
+	// Latency is measured from just before the call, not from the start of the
+	// cycle: Aggregator.Snapshot and Detector.Select can cost tens of
+	// milliseconds at scale (spec §5.9 budgets BenchmarkDetectorSelect at up to
+	// 50ms), and that cost must not be misattributed to the judge in
+	// judge_latency_seconds or in the decision record (M3).
+	judgeStarted := c.opts.Clock.Now()
 	judgeCtx, cancel := context.WithTimeout(ctx, c.opts.Timeout)
 	verdicts, err := active.Judge(judgeCtx, suspects)
 	cancel()
+	latency := c.opts.Clock.Now().Sub(judgeStarted)
 
-	latency := c.opts.Clock.Now().Sub(started)
 	outcome := OutcomeOK
 	switch {
 	case err == nil:
@@ -202,9 +227,23 @@ func (c *Controller) Cycle(ctx context.Context) []DecisionRecord {
 	if tracked && c.opts.Breaker != nil {
 		c.opts.Breaker.Record(err)
 	}
+
+	// A judge that tracks its own token cost (the typesafe judge) is charged
+	// against the daily budget here, whether or not the call ultimately
+	// failed: a batch split across several requests can have already spent
+	// tokens on the requests that succeeded before a later one errored or
+	// timed out, and those tokens were still billed (spec §5.6, §9).
+	var inputTokens int64
+	if reporter, ok := active.(judge.UsageReporter); ok {
+		inputTokens = reporter.InputTokens()
+		if inputTokens > 0 && c.opts.Budget != nil {
+			c.opts.Budget.RecordTokens(inputTokens)
+		}
+	}
+
 	c.opts.Observer.Observe(Event{
 		Kind: EventJudgeCall, Judge: active.Name(), Outcome: outcome,
-		Latency: latency, Suspects: len(suspects),
+		Latency: latency, Suspects: len(suspects), InputTokens: inputTokens,
 	})
 
 	if err != nil {
@@ -214,14 +253,22 @@ func (c *Controller) Cycle(ctx context.Context) []DecisionRecord {
 		return nil
 	}
 
-	records := c.apply(ctx, suspects, verdicts, active, started)
+	records := c.apply(ctx, suspects, verdicts, active, started, mode, latency)
 	c.opts.Observer.Observe(Event{Kind: EventCycle, Duration: c.opts.Clock.Now().Sub(started)})
 	c.observeActiveTiers(ctx, started)
 	return records
 }
 
 // apply runs the guardrails over the verdicts and writes the approved tiers.
-func (c *Controller) apply(ctx context.Context, suspects []detect.Suspect, verdicts []judge.Verdict, active judge.Judge, now time.Time) []DecisionRecord {
+//
+// mode and judgeLatency are the values Cycle captured once before this loop
+// started, so every record in the batch is judged and reported against the
+// same live mode (M1) and the same judge-only latency (M3), regardless of how
+// long the loop itself takes to run.
+func (c *Controller) apply(
+	ctx context.Context, suspects []detect.Suspect, verdicts []judge.Verdict, active judge.Judge,
+	now time.Time, mode Mode, judgeLatency time.Duration,
+) []DecisionRecord {
 	byID := make(map[string]*detect.Suspect, len(suspects))
 	for i := range suspects {
 		byID[suspects[i].SuspectID] = &suspects[i]
@@ -229,6 +276,7 @@ func (c *Controller) apply(ctx context.Context, suspects []detect.Suspect, verdi
 
 	activeIdentities := c.opts.Aggregator.Tracked()
 	nonNormal := c.countNonNormal(ctx, now)
+	latencyMS := float64(judgeLatency.Microseconds()) / 1000.0
 
 	records := make([]DecisionRecord, 0, len(verdicts))
 	for _, verdict := range verdicts {
@@ -247,7 +295,7 @@ func (c *Controller) apply(ctx context.Context, suspects []detect.Suspect, verdi
 			Proposed:            proposed,
 			Current:             current,
 			CurrentSet:          currentSet,
-			Mode:                c.Mode(),
+			Mode:                mode,
 			ActiveIdentities:    activeIdentities,
 			NonNormalIdentities: nonNormal,
 			NewBlocksThisCycle:  c.newBlocksThisCycle,
@@ -284,12 +332,36 @@ func (c *Controller) apply(ctx context.Context, suspects []detect.Suspect, verdi
 			Previous:   previous,
 			Guardrails: outcome.Applied,
 			Reason:     outcome.Reason,
-			Mode:       c.opts.Mode,
-			LatencyMS:  float64(c.opts.Clock.Now().Sub(now).Microseconds()) / 1000.0,
+			Mode:       mode,
+			LatencyMS:  latencyMS,
+		}
+
+		// The running population feeds G5 (blast radius) for the rest of this
+		// cycle's verdicts, rather than the stale count taken before the loop
+		// (M2). Both counters track what the guardrails approved, not what was
+		// written, so shadow mode sees the same escalation ceiling enforce
+		// mode would hit — with one unavoidable asymmetry: G3 already caps
+		// block at strict outside enforce mode, so newBlocksThisCycle only
+		// ever moves in enforce mode. That is G3's design, not an oversight
+		// here.
+		//
+		// The tier, not merely the presence of an entry, decides what counts:
+		// G6 returns a manual entry untouched with HasEntry set, and a manual
+		// entry pinned at "normal" is not part of the non-normal population
+		// that countNonNormal measured. An identity can only add to the count
+		// once per cycle, because G9 forbids de-escalation, so previous is
+		// Normal exactly once.
+		if outcome.HasEntry && outcome.Tier > policy.TierNormal {
+			if previous == policy.TierNormal {
+				nonNormal++
+			}
+			if outcome.Tier == policy.TierBlock && previous != policy.TierBlock {
+				c.newBlocksThisCycle++
+			}
 		}
 
 		// G10: shadow mode computes and audits everything but never writes.
-		if c.Mode() == ModeEnforce && outcome.HasEntry && outcome.Tier != previous {
+		if mode == ModeEnforce && outcome.HasEntry && outcome.Tier != previous {
 			entry := policy.TierEntry{
 				Tier:       outcome.Tier,
 				Until:      outcome.Until,
@@ -303,9 +375,6 @@ func (c *Controller) apply(ctx context.Context, suspects []detect.Suspect, verdi
 				c.opts.Observer.Observe(Event{
 					Kind: EventTierTransition, From: previous, To: outcome.Tier, Source: entry.Source,
 				})
-				if outcome.Tier == policy.TierBlock && previous != policy.TierBlock {
-					c.newBlocksThisCycle++
-				}
 			}
 		}
 

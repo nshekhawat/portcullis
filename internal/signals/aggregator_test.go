@@ -357,8 +357,13 @@ func TestAggregatePrefixes(t *testing.T) {
 			})
 			agg.Record(request(tt.identity, base))
 
+			// apply() folds the identity and its prefix aggregate under two
+			// separate shard locks (aggregator.go), so waiting on only the
+			// identity's window can observe a Snapshot taken between the two
+			// writes and see the aggregate window still missing (M7). Wait for
+			// every window the test expects instead of just the first one.
 			want := int64(1)
-			waitForWindow(t, func() bool { return totalFor(agg, tt.identity, base) == want })
+			waitForWindow(t, func() bool { return len(agg.Snapshot(base)) == len(tt.want) })
 			assert.Equal(t, tt.want, windowIdentities(agg.Snapshot(base)))
 
 			for _, id := range tt.want {

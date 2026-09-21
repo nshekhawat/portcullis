@@ -120,6 +120,31 @@ func (s *MemoryStore) replaceAll(entries map[string]TierEntry) {
 	}
 }
 
+// StartPruning runs Prune on a ticker until ctx is canceled.
+//
+// Lookup and List already filter expired entries out of anything they
+// return, but nothing shrinks the underlying maps on its own: without this,
+// an identity that keeps getting escalated under a rotating address — the
+// traffic this store exists to act on — grows the store without bound (H2).
+// interval defaults to one minute when zero or negative.
+func (s *MemoryStore) StartPruning(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.Prune(s.clk.Now())
+			}
+		}
+	}()
+}
+
 // Prune drops expired entries and reports how many it removed.
 func (s *MemoryStore) Prune(now time.Time) int {
 	removed := 0

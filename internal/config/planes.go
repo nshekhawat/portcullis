@@ -401,6 +401,17 @@ func (c *Config) validatePlanes() error {
 			if _, err := policy.ParseTier(rule.Tier); err != nil {
 				return fmt.Errorf("judgment policy.%s[%d]: %w", label, i, err)
 			}
+			// PolicyFor (below) returns the first rule a verdict's confidence
+			// clears, so the list must already be highest-confidence first, as
+			// spec §5.1 documents it. An ascending list would make every
+			// high-confidence verdict match the loosest rule first and never
+			// reach the stricter one behind it — silent under-enforcement on a
+			// plausible typo, for a config that governs enforcement severity.
+			if i > 0 && rule.MinConfidence > rules[i-1].MinConfidence {
+				return fmt.Errorf(
+					"judgment policy.%s must be in descending order of min_confidence (rule %d, %.2f, follows rule %d, %.2f)",
+					label, i, rule.MinConfidence, i-1, rules[i-1].MinConfidence)
+			}
 		}
 	}
 

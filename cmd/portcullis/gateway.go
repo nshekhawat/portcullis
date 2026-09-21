@@ -105,6 +105,7 @@ func runGateway(args []string) error {
 		IdentifierHeader:  cfg.Gateway.IdentifierHeader,
 		APIKeyHeader:      cfg.Gateway.APIKeyHeader,
 		Routes:            gatewayRoutes(cfg.Gateway.Routes),
+		Store:             store,
 		RegisterAdmin:     adminRouter(limiter, store, cfg, judgment, trustedProxies, logger),
 	}, logger)
 	if err != nil {

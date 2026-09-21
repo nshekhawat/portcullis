@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -107,8 +108,10 @@ func TestRedisTierStore_Resync(t *testing.T) {
 	assert.Equal(t, "manual", entry.Source)
 }
 
-// TestRedisTierStore_ListAndExpiry checks the authoritative read and that
-// expired entries are filtered by the mirror.
+// TestRedisTierStore_ListAndExpiry checks that List honors the TierStore
+// contract ("List returns every active entry", policy.go): an expired entry
+// is filtered out, the same as MemoryStore.List, rather than reported as
+// still applying.
 func TestRedisTierStore_ListAndExpiry(t *testing.T) {
 	client, cleanup := startRedisTierStore(t)
 	defer cleanup()
@@ -124,10 +127,77 @@ func TestRedisTierStore_ListAndExpiry(t *testing.T) {
 
 	listed, err := store.List(ctx)
 	require.NoError(t, err)
-	assert.Len(t, listed, 2, "List reads Redis, including expired entries")
+	require.Len(t, listed, 1, "List must filter expired entries")
+	_, ok := listed["a"]
+	assert.True(t, ok)
 
-	_, ok := store.Lookup("b", time.Now())
+	_, ok = store.Lookup("b", time.Now())
 	assert.False(t, ok, "an expired entry must not apply")
+}
+
+// TestRedisTierStore_ReapsExpiredFields is the regression for H2: Redis must
+// not accumulate expired tier entries forever. A field past its Until is
+// removed from the hash the next time readAll runs (via Resync or List),
+// instead of staying until an operator issues an explicit Delete.
+func TestRedisTierStore_ReapsExpiredFields(t *testing.T) {
+	client, cleanup := startRedisTierStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	store, err := NewRedisStore(ctx, client, RedisOptions{})
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	require.NoError(t, store.Set(ctx, "expired", TierEntry{Tier: TierBlock, Until: time.Now().Add(-time.Minute)}))
+	require.NoError(t, store.Set(ctx, "live", TierEntry{Tier: TierWatch, Until: time.Now().Add(time.Hour)}))
+
+	require.NoError(t, store.Resync(ctx))
+
+	fields, err := client.HGetAll(ctx, DefaultTierKey).Result()
+	require.NoError(t, err)
+	assert.NotContains(t, fields, "expired", "an expired field must be reaped from Redis, not just filtered on read")
+	assert.Contains(t, fields, "live")
+}
+
+// TestRedisTierStore_ReapSkipsConcurrentlyRefreshedEntry guards the reaper
+// against the B6 class of bug: between the HGETALL that decided an entry was
+// expired and the delete that acts on it, another replica can re-escalate
+// that identity. Deleting blindly would drop the fresh entry and hand the
+// identity back its full quota — a limit bypass, and exactly the TOCTOU the
+// memory backend fixed with CompareAndDelete.
+//
+// The reap therefore deletes a field only while it still holds the exact
+// value the read saw. This drives reapExpired directly with a stale value,
+// which is the race's outcome without the timing.
+func TestRedisTierStore_ReapSkipsConcurrentlyRefreshedEntry(t *testing.T) {
+	client, cleanup := startRedisTierStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	store, err := NewRedisStore(ctx, client, RedisOptions{})
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	staleRaw, err := json.Marshal(TierEntry{
+		Tier: TierBlock, Until: time.Now().Add(-time.Minute), Source: "judge:rules",
+	})
+	require.NoError(t, err)
+
+	// What another replica wrote after this one read the stale value.
+	fresh := TierEntry{Tier: TierBlock, Until: time.Now().Add(time.Hour), Source: "judge:rules"}
+	require.NoError(t, store.Set(ctx, "rotating", fresh))
+
+	store.reapExpired(ctx, map[string]string{"rotating": string(staleRaw)})
+
+	got, err := client.HGet(ctx, DefaultTierKey, "rotating").Result()
+	require.NoError(t, err, "the refreshed entry must survive the reap")
+
+	var decoded TierEntry
+	require.NoError(t, json.Unmarshal([]byte(got), &decoded))
+	assert.True(t, decoded.Active(time.Now()), "the surviving entry must be the fresh one")
+	assert.Equal(t, TierBlock, decoded.Tier)
 }
 
 // TestRedisTierStore_UnreadableEntryIsSkipped checks that one corrupt field does

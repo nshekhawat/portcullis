@@ -192,6 +192,24 @@ func (g *Guardrails) Apply(in Input) Outcome {
 		}
 	}
 
+	if target == policy.TierNormal {
+		// Normal is the absence of an entry, not an entry of its own, and this
+		// is checked before the TTL lookup below on purpose: a real
+		// deployment's judgment.tiers never configures "normal" (spec §5.1
+		// only lists watch/throttle/strict/block), so ttlFor(Normal, ...)
+		// always returns 0 — the same signal ttlFor uses for a genuinely
+		// missing tier configuration. Checking here first keeps "nothing to
+		// escalate" from being reported as "no tier configuration" in the
+		// audit trail (L2).
+		return Outcome{
+			Tier:     policy.TierNormal,
+			Until:    time.Time{},
+			Applied:  applied,
+			Reason:   "no escalation",
+			HasEntry: false,
+		}
+	}
+
 	// G4: the tier config owns the TTL, capped by max_ttl. The judge never sets
 	// a lifetime.
 	ttl := g.ttlFor(target, in.TierConfigs)
@@ -208,17 +226,6 @@ func (g *Guardrails) Apply(in Input) Outcome {
 	if in.Now.Add(g.MaxTTL).Before(until) {
 		until = in.Now.Add(g.MaxTTL)
 		applied = append(applied, GuardrailTTLCap)
-	}
-
-	if target == policy.TierNormal {
-		// Normal is the absence of an entry, not an entry of its own.
-		return Outcome{
-			Tier:     policy.TierNormal,
-			Until:    time.Time{},
-			Applied:  applied,
-			Reason:   "no escalation",
-			HasEntry: false,
-		}
 	}
 
 	return Outcome{

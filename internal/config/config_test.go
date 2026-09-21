@@ -215,6 +215,33 @@ func TestConfig_Validate(t *testing.T) {
 			errorMsg:    "invalid log level",
 		},
 		{
+			// M5: PolicyFor (planes.go) returns the first rule whose
+			// min_confidence a verdict clears, so the list must already be
+			// sorted highest confidence first, as spec §5.1 documents it. A
+			// list given in ascending order would make every high-confidence
+			// verdict match the low-confidence rule first and never reach the
+			// stricter one behind it, which under-enforces silently. Validate
+			// rejects it instead of guessing which order was intended.
+			name: "judgment policy rules out of order",
+			modifier: func(c *Config) {
+				c.Judgment.Policy["scraper"] = []PolicyRule{
+					{MinConfidence: 0.6, Tier: "watch"},
+					{MinConfidence: 0.8, Tier: "throttle"},
+				}
+			},
+			expectError: true,
+			errorMsg:    "must be in descending order",
+		},
+		{
+			name: "judgment policy rules already descending",
+			modifier: func(c *Config) {
+				c.Judgment.Policy["scraper"] = []PolicyRule{
+					{MinConfidence: 0.8, Tier: "throttle"},
+					{MinConfidence: 0.6, Tier: "watch"},
+				}
+			},
+		},
+		{
 			name: "invalid log format",
 			modifier: func(c *Config) {
 				c.Logging.Format = "xml"

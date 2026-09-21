@@ -27,6 +27,7 @@ import (
 	"github.com/nshekhawat/portcullis/internal/middleware"
 	"github.com/nshekhawat/portcullis/internal/ratelimiter"
 	"github.com/nshekhawat/portcullis/internal/signals"
+	"github.com/nshekhawat/portcullis/internal/storage"
 )
 
 // unmatchedRoute is the resource used when no gateway route matches a request.
@@ -69,6 +70,10 @@ type Config struct {
 	Signals signals.Recorder
 	// Metrics is the metrics registry to record into; it is optional.
 	Metrics *metrics.Metrics
+	// Store, when set, is pinged by /ready so readiness reflects storage
+	// health (B19) rather than a limiter lookup that memory storage can never
+	// fail. Optional so tests that do not care about readiness may omit it.
+	Store storage.Storage
 	// RegisterAdmin, when set, mounts the full admin API on the admin listener.
 	// The caller owns its authentication.
 	RegisterAdmin func(router gin.IRouter)
@@ -275,8 +280,11 @@ func (g *Gateway) buildAdminEngine() *gin.Engine {
 	engine.GET("/ready", func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 		defer cancel()
-		if g.limiter != nil {
-			if _, err := g.limiter.GetLimitInfo(ctx, "gateway-readiness", ""); err != nil {
+		// Ping storage directly (B19, and its gateway-mode reintroduction,
+		// L1): a lookup against memory storage can never fail, so it was
+		// really a constant 200 rather than a readiness check.
+		if g.config.Store != nil {
+			if err := g.config.Store.Ping(ctx); err != nil {
 				c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not ready", "error": err.Error()})
 				return
 			}
@@ -308,6 +316,10 @@ func (g *Gateway) Handler() http.Handler { return g.engine }
 func (g *Gateway) AdminHandler() http.Handler { return g.adminEngine }
 
 // Start serves both listeners until Shutdown.
+//
+// If either listener fails to start, the other is shut down too before Start
+// returns, so a caller that treats a Start error as fatal is not left with a
+// background listener still holding its port (L7).
 func (g *Gateway) Start() error {
 	errCh := make(chan error, 2)
 
@@ -324,7 +336,15 @@ func (g *Gateway) Start() error {
 		}
 	}()
 
-	return <-errCh
+	err := <-errCh
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if shutdownErr := g.Shutdown(shutdownCtx); shutdownErr != nil {
+		g.logger.Warn("failed to shut down the other listener after a startup error", zap.Error(shutdownErr))
+	}
+
+	return err
 }
 
 // Shutdown stops both listeners.

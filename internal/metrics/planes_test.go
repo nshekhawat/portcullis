@@ -72,9 +72,11 @@ func TestSignalsObserver_RecordsCounters(t *testing.T) {
 	assert.Equal(t, float64(1500), testutil.ToFloat64(m.TrackedIdentities))
 }
 
-// TestDecisionRecorder_BlockedTierDenial covers tier_denials_total, which is the
-// only place a blocked decision is visible in metrics.
-func TestDecisionRecorder_BlockedTierDenial(t *testing.T) {
+// TestDecisionRecorder_TierDenial covers tier_denials_total: any denial for an
+// identity holding a non-normal tier is attributed to that tier, whether the
+// tier refused outright (ReasonBlocked) or the tier's scaled-down bucket ran
+// dry (ReasonLimit). A denial for an untiered identity is not a tier denial.
+func TestDecisionRecorder_TierDenial(t *testing.T) {
 	m := newTestMetrics()
 	recorder := NewDecisionRecorder(m, "login")
 
@@ -86,10 +88,26 @@ func TestDecisionRecorder_BlockedTierDenial(t *testing.T) {
 		Allowed: false, IdentifierType: "ip", Resource: "login", Tokens: 1,
 		Reason: ratelimiter.ReasonLimit, Tier: policy.TierThrottle,
 	})
+	recorder.ObserveDecision(ratelimiter.Observation{
+		Allowed: false, IdentifierType: "ip", Resource: "login", Tokens: 1,
+		Reason: ratelimiter.ReasonLimit, Tier: policy.TierNormal,
+	})
+	// A storage failure would have denied this request whatever tier the
+	// identity held, so it is not attributable to the tier. It belongs to
+	// the storage-failure series instead.
+	recorder.ObserveDecision(ratelimiter.Observation{
+		Allowed: false, IdentifierType: "ip", Resource: "login", Tokens: 1,
+		Reason: ratelimiter.ReasonStorageError, Tier: policy.TierStrict,
+	})
 
 	assert.Equal(t, float64(1), testutil.ToFloat64(m.TierDenials.WithLabelValues("block")))
-	assert.Equal(t, float64(0), testutil.ToFloat64(m.TierDenials.WithLabelValues("throttle")))
-	assert.Equal(t, float64(2), testutil.ToFloat64(m.RateLimitDenied.WithLabelValues("ip", "login")))
+	assert.Equal(t, float64(1), testutil.ToFloat64(m.TierDenials.WithLabelValues("throttle")))
+	assert.Equal(t, float64(0), testutil.ToFloat64(m.TierDenials.WithLabelValues("normal")))
+	assert.Equal(t, float64(0), testutil.ToFloat64(m.TierDenials.WithLabelValues("strict")),
+		"an infrastructure failure is not a tier denial")
+	assert.Equal(t, float64(1),
+		testutil.ToFloat64(m.RateLimitStorageFailures.WithLabelValues(string(ratelimiter.ReasonStorageError))))
+	assert.Equal(t, float64(4), testutil.ToFloat64(m.RateLimitDenied.WithLabelValues("ip", "login")))
 }
 
 func TestObservers_DefaultToGlobalMetrics(t *testing.T) {

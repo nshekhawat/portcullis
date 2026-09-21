@@ -183,6 +183,20 @@ func NewRateLimiter(store storage.AtomicStorage, config *Config, logger *zap.Log
 		config.DefaultRule = DefaultConfig().DefaultRule
 	}
 	config.DefaultRule.Normalize()
+	// Every configured rule is normalized once here, up front, rather than
+	// lazily on the hot path: getRule and AllowWithRule used to call
+	// rule.Normalize() on every request, mutating the shared *Rule from
+	// config.Rules in place. DefaultRule's one-time normalization above never
+	// raced because it runs before any request is served, but a named rule
+	// was normalized lazily on first use instead, and concurrent first hits
+	// on the same rule raced on r.Period (L9).
+	// A nil entry is tolerated rather than dereferenced: getRule hands it
+	// straight to AllowWithRule, which already falls back to the default rule.
+	for _, rule := range config.Rules {
+		if rule != nil {
+			rule.Normalize()
+		}
+	}
 
 	rl := &RateLimiter{
 		storage: store,
@@ -220,7 +234,10 @@ func (rl *RateLimiter) AllowWithRule(ctx context.Context, identifier, resource s
 	if rule == nil {
 		rule = rl.config.DefaultRule
 	}
-	rule.Normalize()
+	// Deliberately not rule.Normalize() here: this runs on every request, and
+	// mutating a *Rule the caller may be sharing across goroutines is a data
+	// race (L9). RatePerSecond already falls back to a one-second period on
+	// its own when Period is zero, so nothing downstream needs the mutation.
 
 	if err := ValidateKey(identifier, resource); err != nil {
 		return nil, err
@@ -357,6 +374,7 @@ func (rl *RateLimiter) observe(identifier, resource string, tokens int64, decisi
 		Resource:       resource,
 		Tokens:         tokens,
 		Reason:         decision.Reason,
+		Tier:           decision.Tier,
 	})
 }
 
@@ -442,7 +460,8 @@ func (rl *RateLimiter) ResetLimit(ctx context.Context, identifier, resource stri
 func (rl *RateLimiter) getRule(resource string) *Rule {
 	if resource != "" && rl.config.Rules != nil {
 		if rule, ok := rl.config.Rules[strings.ToLower(resource)]; ok {
-			rule.Normalize()
+			// Not rule.Normalize() here (L9): every rule in config.Rules was
+			// already normalized once, up front, in NewRateLimiter.
 			return rule
 		}
 	}

@@ -334,3 +334,31 @@ func TestGuardrails_NoTierConfigLeavesStateAlone(t *testing.T) {
 	assert.Equal(t, policy.TierNormal, out.Tier)
 	assert.False(t, out.HasEntry)
 }
+
+// TestGuardrails_NoEscalationReasonWhenTargetStaysNormal is the regression
+// for L2: a real deployment's judgment.tiers never configures "normal" (spec
+// §5.1 only lists watch/throttle/strict/block), so ttlFor(Normal, ...)
+// returns 0 — the same signal as a genuinely missing tier configuration. A
+// verdict that never escalates past Normal used to fall through that branch
+// and report "no tier configuration", which reads as a misconfiguration in
+// the audit trail when the real story is "nothing to escalate".
+func TestGuardrails_NoEscalationReasonWhenTargetStaysNormal(t *testing.T) {
+	g := guardrailsFixture(t)
+
+	in := baseInput(t)
+	in.Proposed = policy.TierNormal
+	in.Suspect.Evidence = nil
+	// Deliberately omit TierNormal, matching what a real deployment's
+	// judgment.tiers actually configures.
+	in.TierConfigs = map[policy.Tier]policy.TierConfig{
+		policy.TierWatch:    {Multiplier: 1.0, TTL: 10 * time.Minute},
+		policy.TierThrottle: {Multiplier: 0.25, TTL: 15 * time.Minute},
+		policy.TierStrict:   {Multiplier: 0.05, TTL: 30 * time.Minute},
+		policy.TierBlock:    {Multiplier: 0.0, TTL: time.Hour},
+	}
+
+	out := g.Apply(in)
+	assert.Equal(t, policy.TierNormal, out.Tier)
+	assert.False(t, out.HasEntry)
+	assert.Equal(t, "no escalation", out.Reason, "staying at Normal must not be reported as a missing tier configuration")
+}

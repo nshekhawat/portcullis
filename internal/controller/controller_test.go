@@ -24,17 +24,31 @@ type stubJudge struct {
 	verdicts []judge.Verdict
 	err      error
 	calls    atomic.Int64
+
+	// clk and advance let a test simulate how long the call itself took,
+	// distinct from however long detection took before it.
+	clk         *clock.Fake
+	advance     time.Duration
+	inputTokens int64
 }
 
 func (s *stubJudge) Name() string { return s.name }
 
 func (s *stubJudge) Judge(context.Context, []detect.Suspect) ([]judge.Verdict, error) {
 	s.calls.Add(1)
+	if s.clk != nil && s.advance > 0 {
+		s.clk.Advance(s.advance)
+	}
 	if s.err != nil {
 		return nil, s.err
 	}
 	return s.verdicts, nil
 }
+
+// InputTokens implements judge.UsageReporter.
+func (s *stubJudge) InputTokens() int64 { return s.inputTokens }
+
+var _ judge.UsageReporter = (*stubJudge)(nil)
 
 // stubAggregator serves a fixed snapshot.
 type stubAggregator struct {
@@ -51,9 +65,17 @@ func (s *stubAggregator) Tracked() int { return s.tracked }
 // stubDetector serves a fixed suspect list.
 type stubDetector struct {
 	suspects []detect.Suspect
+
+	// clk and advance let a test simulate how long detection took, distinct
+	// from however long the judge call afterwards took.
+	clk     *clock.Fake
+	advance time.Duration
 }
 
 func (s *stubDetector) Select([]signals.IdentityWindow, policy.TierStore, time.Time) []detect.Suspect {
+	if s.clk != nil && s.advance > 0 {
+		s.clk.Advance(s.advance)
+	}
 	return s.suspects
 }
 
@@ -175,6 +197,63 @@ func TestCycle_EnforceWritesTier(t *testing.T) {
 	assert.Equal(t, policy.TierBlock, transitions[0].To)
 }
 
+// TestCycle_ModeFlipMidCycleUsesLiveMode is the regression for M1: a mode
+// change made between cycles must be reflected both in whether tiers are
+// written and in the DecisionRecord's Mode field. Before the fix, apply()
+// closed over the Options.Mode captured at construction time, so a decision
+// record kept reporting the startup mode forever, and a flip to enforce made
+// after Options were built could write tiers while records still said
+// "shadow".
+func TestCycle_ModeFlipMidCycleUsesLiveMode(t *testing.T) {
+	f := newFixture(t, ModeShadow)
+
+	records := f.controller.Cycle(context.Background())
+	require.Len(t, records, 1)
+	assert.Equal(t, ModeShadow, records[0].Mode)
+	_, ok := f.tiers.Lookup("203.0.113.9", f.clk.Now())
+	assert.False(t, ok, "shadow mode must not write a tier")
+
+	require.NoError(t, f.controller.SetMode(ModeEnforce))
+
+	records = f.controller.Cycle(context.Background())
+	require.Len(t, records, 1)
+	assert.Equal(t, ModeEnforce, records[0].Mode, "the record must reflect the live mode, not the startup mode")
+	entry, ok := f.tiers.Lookup("203.0.113.9", f.clk.Now())
+	require.True(t, ok, "enforce mode must write the tier once the mode has flipped")
+	assert.Equal(t, policy.TierBlock, entry.Tier)
+}
+
+// TestCycle_JudgeLatencyExcludesDetection is the regression for M3:
+// judge_latency_seconds (EventJudgeCall.Latency) and DecisionRecord.LatencyMS
+// must measure the judge call itself, not the whole cycle. Before the fix,
+// both were measured from the start of the cycle, so time spent in
+// Aggregator.Snapshot and Detector.Select was misattributed to the judge.
+func TestCycle_JudgeLatencyExcludesDetection(t *testing.T) {
+	f := newFixture(t, ModeEnforce)
+	detection := 200 * time.Millisecond
+	judgeCall := 10 * time.Millisecond
+	f.controller.opts.Detector = &stubDetector{
+		suspects: []detect.Suspect{f.suspect},
+		clk:      f.clk,
+		advance:  detection,
+	}
+	f.primary.clk = f.clk
+	f.primary.advance = judgeCall
+
+	records := f.controller.Cycle(context.Background())
+	require.Len(t, records, 1)
+	assert.InDelta(t, float64(judgeCall.Milliseconds()), records[0].LatencyMS, 0.01,
+		"the record's latency must be the judge call, not the cycle")
+
+	calls := f.observer.ofKind(EventJudgeCall)
+	require.Len(t, calls, 1)
+	assert.Equal(t, judgeCall, calls[0].Latency, "judge_latency_seconds must not include detection time")
+
+	cycles := f.observer.ofKind(EventCycle)
+	require.Len(t, cycles, 1)
+	assert.GreaterOrEqual(t, cycles[0].Duration, detection+judgeCall, "the cycle event still covers the whole cycle")
+}
+
 // TestShadowMode_NoWrites covers G10: shadow mode audits everything and changes
 // nothing.
 func TestShadowMode_NoWrites(t *testing.T) {
@@ -250,6 +329,33 @@ func TestCycle_DailyTokenBudgetStopsCalls(t *testing.T) {
 
 	assert.Empty(t, f.controller.Cycle(context.Background()))
 	assert.Equal(t, int64(1), f.primary.calls.Load())
+}
+
+// TestCycle_ChargesReportedTokensAgainstBudget is the regression for H1: a
+// judge that reports its usage must have those tokens charged against the
+// daily budget automatically. Before the fix, only tests called
+// Budget.RecordTokens; the production Cycle path never did, so
+// max_input_tokens_per_day never took effect and judge_input_tokens_total
+// stayed at zero.
+func TestCycle_ChargesReportedTokensAgainstBudget(t *testing.T) {
+	f := newFixture(t, ModeEnforce)
+	f.primary.inputTokens = 7
+	budget := NewBudget(100, 20, f.clk)
+	f.controller.opts.Budget = budget
+
+	require.Len(t, f.controller.Cycle(context.Background()), 1)
+	assert.Equal(t, int64(7), budget.TokensUsed(), "usage reported by the judge must be charged automatically")
+
+	calls := f.observer.ofKind(EventJudgeCall)
+	require.Len(t, calls, 1)
+	assert.Equal(t, int64(7), calls[0].InputTokens, "judge_input_tokens_total is fed from this event")
+
+	// The daily cap now stops calls once the reported usage crosses it,
+	// without any test-side bookkeeping.
+	f.primary.inputTokens = 20
+	require.Len(t, f.controller.Cycle(context.Background()), 1)
+	assert.Equal(t, int64(27), budget.TokensUsed())
+	assert.Empty(t, f.controller.Cycle(context.Background()), "the daily cap must now block further calls")
 }
 
 // TestCycle_BreakerOpensAfterN covers the breaker opening on consecutive errors
@@ -376,6 +482,52 @@ func TestCycle_BlastRadiusStopsEscalation(t *testing.T) {
 	assert.False(t, ok)
 }
 
+// TestCycle_ManualNormalEntryIsNotCountedAsNonNormal pins the running
+// blast-radius population against countNonNormal's own definition: an
+// identity is non-normal only when its tier is actually above Normal.
+//
+// A manual entry pinned at "normal" still comes back from the guardrails with
+// HasEntry set (G6 returns manual entries untouched) and a previous tier of
+// Normal, so a naive "HasEntry and previous was Normal" test counts it as a
+// new escalation. In a small population that single miscount is enough to
+// trip G5 and stop every later verdict in the cycle from escalating.
+//
+// The real detector skips manual-tier identities, so this is reachable only
+// through the stub detector — which is the point: it pins the apply loop's
+// own invariant rather than leaning on the detector to hide the case.
+func TestCycle_ManualNormalEntryIsNotCountedAsNonNormal(t *testing.T) {
+	f := newFixture(t, ModeEnforce)
+	f.controller.opts.Aggregator = &stubAggregator{tracked: 100}
+	// Any single non-normal identity out of 100 exceeds this fraction.
+	f.controller.opts.Guardrails.MaxNonNormalFraction = 0.005
+
+	manual := detect.Suspect{
+		SuspectID: "s00",
+		Identity:  "203.0.113.1",
+		Score:     9,
+		Evidence:  []string{detect.EvidenceScannerPaths},
+	}
+	escalating := f.suspect
+	escalating.SuspectID = "s01"
+
+	f.controller.opts.Detector = &stubDetector{suspects: []detect.Suspect{manual, escalating}}
+	f.primary.verdicts = []judge.Verdict{
+		{SuspectID: "s00", Label: judge.LabelVulnerabilityScanner, Confidence: 0.95},
+		{SuspectID: "s01", Label: judge.LabelVulnerabilityScanner, Confidence: 0.95},
+	}
+
+	require.NoError(t, f.tiers.Set(context.Background(), manual.Identity, policy.TierEntry{
+		Tier: policy.TierNormal, Until: f.clk.Now().Add(time.Hour), Source: "manual",
+	}))
+
+	records := f.controller.Cycle(context.Background())
+	require.Len(t, records, 2)
+	assert.Equal(t, policy.TierNormal, records[0].Applied, "the manual entry is returned untouched")
+	assert.Equal(t, policy.TierBlock, records[1].Applied,
+		"an identity sitting at normal must not count toward the blast-radius population")
+	assert.NotContains(t, records[1].Guardrails, GuardrailBlastRadius)
+}
+
 // TestCycle_MaxNewBlocksPerCycle covers the per-cycle block meter.
 func TestCycle_MaxNewBlocksPerCycle(t *testing.T) {
 	f := newFixture(t, ModeEnforce)
@@ -418,4 +570,35 @@ func TestModeOffDoesNothing(t *testing.T) {
 	assert.Empty(t, f.controller.Cycle(context.Background()))
 	assert.Zero(t, f.primary.calls.Load())
 	assert.Equal(t, 0, f.audit.Len())
+}
+
+// TestRun_RecoversAfterModeFlippedFromOff is the regression for M4: a
+// controller started with mode "off" must still run cycles once an operator
+// flips it at runtime. Before the fix, Run returned immediately when the mode
+// was off at startup, so a later SetMode call (as PUT /v1/admin/config/mode
+// makes) changed what Mode() reported but no cycle ever ran again without a
+// process restart.
+func TestRun_RecoversAfterModeFlippedFromOff(t *testing.T) {
+	f := newFixture(t, ModeOff)
+	f.controller.opts.Interval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.controller.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	time.Sleep(30 * time.Millisecond)
+	assert.Empty(t, f.observer.ofKind(EventCycle), "no cycle should run while the mode is off")
+
+	require.NoError(t, f.controller.SetMode(ModeEnforce))
+
+	require.Eventually(t, func() bool {
+		return len(f.observer.ofKind(EventCycle)) > 0
+	}, time.Second, 5*time.Millisecond, "a cycle must run once the mode flips on, without a restart")
 }

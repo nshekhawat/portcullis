@@ -182,6 +182,13 @@ func (c *Client) Usage() Usage {
 	return c.usage
 }
 
+// InputTokens implements judge.UsageReporter: the input tokens the most
+// recent Judge call consumed, summed across however many requests that call
+// split into.
+func (c *Client) InputTokens() int64 {
+	return c.Usage().InputTokens
+}
+
 // request is the System One request body (TypeSafe API reference).
 type request struct {
 	Model     string              `json:"model"`
@@ -561,5 +568,8 @@ func instructions(index int, id string) string {
 	return fmt.Sprintf("Which behavior best describes suspects[%d] (id %s)? Use only that suspect's fields.", index, id)
 }
 
-// Client is a judge.Judge.
-var _ judge.Judge = (*Client)(nil)
+// Client is a judge.Judge and a judge.UsageReporter.
+var (
+	_ judge.Judge         = (*Client)(nil)
+	_ judge.UsageReporter = (*Client)(nil)
+)
