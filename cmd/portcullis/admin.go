@@ -76,18 +76,27 @@ func runAdmin(args []string) error {
 	}
 }
 
-const adminUsage = `usage: portcullis admin <command> [flags]
+const adminUsage = `usage: portcullis admin <command> [flags] [args]
+
+Flags must come before the trailing arguments (identity, tier, mode): the
+standard library's flag package stops parsing flags at the first one, so
+anything after it, including later --flags, is taken literally rather than
+recognized.
 
 Commands:
-  tiers [--watch]                    list active tiers, joined with their decisions
-  decisions [--limit N]              list recent judgment decisions
-  set-tier <identity> <tier> [--ttl] set a manual tier
-  clear-tier <identity>              remove a tier
-  mode [off|shadow|enforce]          show or change the judgment mode
+  tiers [--watch]                       list active tiers, joined with their decisions
+  decisions [--limit N]                 list recent judgment decisions
+  set-tier [--ttl] <identity> <tier>    set a manual tier
+  clear-tier <identity>                 remove a tier
+  mode [off|shadow|enforce]             show or change the judgment mode
 
 Flags:
   --url      admin API base URL (default ` + defaultAdminURL + `)
   --token    admin bearer token (default $PORTCULLIS_ADMIN_TOKENS, first entry)
+
+Examples:
+  portcullis admin mode --url http://localhost:8001 --token $TOKEN enforce
+  portcullis admin set-tier --url http://localhost:8001 --token $TOKEN --ttl 15m 203.0.113.7 throttle
 `
 
 // defaultAdminToken takes the first configured admin token.

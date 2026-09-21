@@ -63,7 +63,7 @@ While it runs:
 ./bin/portcullis admin tiers --watch
 ./bin/portcullis admin decisions --limit 25
 ./bin/portcullis admin mode enforce      # start enforcing what shadow was deciding
-./bin/portcullis admin set-tier 203.0.113.7 throttle --ttl 15m
+./bin/portcullis admin set-tier --ttl 15m 203.0.113.7 throttle
 ```
 
 See [scripts/demo-walkthrough.md](scripts/demo-walkthrough.md) for a five-minute

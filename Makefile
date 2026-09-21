@@ -169,7 +169,7 @@ endif
 	-./$(BUILD_DIR)/$(BINARY_NAME) admin decisions --limit 25 		--url $(DEMO_ADMIN_URL) --token $(DEMO_ADMIN_TOKEN)
 	@echo
 	@echo "Flip to enforce with:"
-	@echo "  ./$(BUILD_DIR)/$(BINARY_NAME) admin mode enforce --url $(DEMO_ADMIN_URL) --token $(DEMO_ADMIN_TOKEN)"
+	@echo "  ./$(BUILD_DIR)/$(BINARY_NAME) admin mode --url $(DEMO_ADMIN_URL) --token $(DEMO_ADMIN_TOKEN) enforce"
 
 # Show the breaker opening while traffic keeps flowing.
 demo-outage: 
