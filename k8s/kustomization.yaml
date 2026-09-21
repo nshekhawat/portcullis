@@ -19,4 +19,4 @@ labels:
 images:
   - name: portcullis
     newName: ghcr.io/nshekhawat/portcullis
-    newTag: 0.1.0
+    newTag: v0.1.0

@@ -7,9 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.0] - 2026-09-21
+
 Portcullis is the renamed and re-scoped successor of `rate-limiter-go`. It adds
 a signals, detection and judgment plane on top of the deterministic token bucket
 data plane.
+
+This is the first release under the new name. It is pre-1.0: the configuration
+surface and the metric names may still move. The data plane is the part to
+trust — it is deterministic, covered by a backend conformance suite, and
+benchmarked against the budgets in `docs/BENCHMARKS.md`. Roll the judgment
+plane out in `shadow` mode first (`docs/OPERATIONS.md`).
 
 ### Breaking
 
@@ -246,4 +256,5 @@ The following come from the post-implementation review in
 - `TestAggregatePrefixes` was order-dependent and could observe a snapshot
   between an observation's two shard-locked writes (M7).
 
-[Unreleased]: https://github.com/nshekhawat/portcullis/commits/main
+[Unreleased]: https://github.com/nshekhawat/portcullis/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/nshekhawat/portcullis/compare/v0.0.1...v0.1.0
