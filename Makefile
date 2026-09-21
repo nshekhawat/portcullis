@@ -158,7 +158,7 @@ endif
 	@echo "Waiting for the gateway to be ready..."
 	@for i in $$(seq 1 60); do 		if curl -sf http://127.0.0.1:8001/ready >/dev/null 2>&1; then break; fi; 		sleep 1; 	done
 	@echo "Generating $(DEMO_TRAFFIC_SECONDS)s of mixed traffic..."
-	$(DEMO_COMPOSE) --profile tools run --rm -T trafficgen 		-scenario mixed -duration $(DEMO_TRAFFIC_SECONDS)s -target http://nginx:8000 &
+	$(DEMO_COMPOSE) --profile tools run --rm -T trafficgen 		trafficgen -scenario mixed -duration $(DEMO_TRAFFIC_SECONDS)s -target http://nginx:8000 &
 	@sleep 2
 	@echo "Live tier table (Ctrl-C to stop watching; traffic keeps flowing):"
 	-./$(BUILD_DIR)/$(BINARY_NAME) admin tiers --watch --interval 2s 		--url $(DEMO_ADMIN_URL) --token $(DEMO_ADMIN_TOKEN)
