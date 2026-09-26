@@ -33,8 +33,7 @@ func runAdmin(args []string) error {
 		return errors.New("no admin command given")
 	}
 
-	sub := args[0]
-	flags := flag.NewFlagSet("admin "+sub, flag.ContinueOnError)
+	flags := flag.NewFlagSet("admin", flag.ContinueOnError)
 	baseURL := flags.String("url", defaultAdminURL, "admin API base URL")
 	token := flags.String("token", defaultAdminToken(), "admin bearer token")
 	watch := flags.Bool("watch", false, "keep printing the table until interrupted")
@@ -42,7 +41,20 @@ func runAdmin(args []string) error {
 	limit := flags.Int("limit", 100, "maximum decisions to fetch")
 	ttl := flags.Duration("ttl", 0, "tier lifetime, e.g. 15m (defaults to the tier's own TTL)")
 
-	if err := flags.Parse(args[1:]); err != nil {
+	// Flags may appear both before the command (so `alias pc="portcullis
+	// admin --url ... --token ..."` works) and after it.
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if flags.NArg() == 0 {
+		fmt.Fprint(os.Stderr, adminUsage)
+		return errors.New("no admin command given")
+	}
+	sub := flags.Arg(0)
+	if err := flags.Parse(flags.Args()[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
@@ -76,9 +88,10 @@ func runAdmin(args []string) error {
 	}
 }
 
-const adminUsage = `usage: portcullis admin <command> [flags] [args]
+const adminUsage = `usage: portcullis admin [flags] <command> [flags] [args]
 
-Flags must come before the trailing arguments (identity, tier, mode): the
+Flags may go before or after the command, but must come before the trailing
+arguments (identity, tier, mode): the
 standard library's flag package stops parsing flags at the first one, so
 anything after it, including later --flags, is taken literally rather than
 recognized.
@@ -95,6 +108,7 @@ Flags:
   --token    admin bearer token (default $PORTCULLIS_ADMIN_TOKENS, first entry)
 
 Examples:
+  portcullis admin --url http://localhost:8001 --token $TOKEN mode enforce
   portcullis admin mode --url http://localhost:8001 --token $TOKEN enforce
   portcullis admin set-tier --url http://localhost:8001 --token $TOKEN --ttl 15m 203.0.113.7 throttle
 `
