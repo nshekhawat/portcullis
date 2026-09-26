@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [0.1.1] - 2026-09-26
+
+### Fixed
+
+- **Admin CLI flag ordering.** `portcullis admin` now accepts `--url` and
+  `--token` both before and after the command name, so
+  `alias pc="portcullis admin --url ... --token ..."` (the form the demo
+  walkthrough sets up) works. Previously the first argument was always taken
+  as the command, so leading flags failed with `unknown admin command
+  "--url"`.
+- `make demo`'s own printed instruction and the README's `set-tier` example
+  put flags after the command's positional arguments, which Go's `flag`
+  package never parses; `--url`, `--token` and `--ttl` were silently
+  ignored. Both examples, and `admin -h`, now show the correct ordering.
+- `make demo`'s `trafficgen` invocation dropped its own binary name from
+  `os.Args`, so its first real flag was never parsed.
+
 ## [0.1.0] - 2026-09-21
 
 Portcullis is the renamed and re-scoped successor of `rate-limiter-go`. It adds
@@ -256,5 +273,6 @@ The following come from the post-implementation review in
 - `TestAggregatePrefixes` was order-dependent and could observe a snapshot
   between an observation's two shard-locked writes (M7).
 
-[Unreleased]: https://github.com/nshekhawat/portcullis/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/nshekhawat/portcullis/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/nshekhawat/portcullis/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nshekhawat/portcullis/compare/v0.0.1...v0.1.0
