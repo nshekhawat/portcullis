@@ -175,7 +175,7 @@ func TestJudgeErrors(t *testing.T) {
 		require.Error(t, err)
 	})
 
-	t.Run("cancelled context", func(t *testing.T) {
+	t.Run("canceled context", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		_, err := New(Options{BaseURL: "http://127.0.0.1:1", Model: "m"}).Judge(ctx, []detect.Suspect{floodSuspect("s00")})
