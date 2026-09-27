@@ -115,7 +115,7 @@ detection:
 
 judgment:
   mode: shadow                   # off | shadow | enforce
-  judge: rules                   # rules | typesafe | mock
+  judge: rules                   # rules | typesafe | systemone | openai | mock
   fallback_judge: rules          # used while the primary's breaker is open
   timeout: 2s
   budget:
@@ -127,6 +127,20 @@ judgment:
     api_key_env: TYPESAFE_API_KEY
     model: jev-1.13.0            # pin a version; thresholds are tuned to it
     send_sampled_paths: true     # set false in strict environments
+  openai:                        # judge: openai — any OpenAI-compatible server
+    base_url: http://localhost:1234/v1  # host:port + /v1; Ollama is http://localhost:11434/v1
+    api_key_env: ""              # env var holding a bearer token; "" = no auth header
+    format: json_schema          # json_schema (chat models) | jevstyle (Jev-style decision models; needs logprobs)
+    calibration_temperature: 1.0 # jevstyle only; 1.0 when the build folds calibration into its weights
+    model: ""                    # required when judge/fallback_judge is openai
+    send_sampled_paths: true
+    max_suspects_per_call: 25    # lower it (5-10) for small local models
+  systemone:                     # judge: systemone — any System One API server other than TypeSafe
+    base_url: http://127.0.0.1:8765     # e.g. a local `jev-style serve`
+    api_key_env: ""              # "" = no auth header
+    model: ""                    # "" = the server's own model
+    send_sampled_paths: true
+    max_suspects_per_call: 1     # small local models judge one suspect per state best
   policy:                        # label -> [{min_confidence, tier}, ...], highest first
     legitimate_burst:      [ { min_confidence: 0.0,  tier: normal } ]
     benign_crawler:        [ { min_confidence: 0.0,  tier: normal } ]

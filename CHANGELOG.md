@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`openai` judge** (`internal/judge/openai`) for self-hosted or third-party
+  models behind the OpenAI chat-completions API: LM Studio, Ollama, vLLM,
+  llama.cpp's server. Configure it under `judgment.openai` (`base_url`,
+  `model`, optional `api_key_env`, `send_sampled_paths`,
+  `max_suspects_per_call`) and select it with `judgment.judge: openai` or
+  `fallback_judge: openai`. An empty `api_key_env` sends no `Authorization`
+  header. Answers are constrained with a `json_schema` response format keyed
+  by suspect id, and it sends the same identity-free state as the typesafe
+  judge. An opt-in live test runs it against a real server
+  (`go test -tags live ./internal/judge/openai`).
+- **`format: jevstyle`** for the `openai` judge. It drives Jev-style decision
+  models (such as `chaoliangUNSW/Jev-Style-*-Decision`) with the model's own
+  `[State]/[Question]/[Options]/Answer:` prompt, one suspect per call, and
+  reads the calibrated label distribution from the option-letter
+  `top_logprobs`. `calibration_temperature` covers builds that do not fold
+  calibration into their weights. A server without logprobs (LM Studio's MLX
+  engine) is an error, never a verdict at an invented confidence.
+- **`systemone` judge** for any System One API server other than TypeSafe,
+  such as a self-hosted `jev-style serve`. It is configured under
+  `judgment.systemone`; auth and model are optional, and
+  `max_suspects_per_call` defaults to 1, which small models need. It reuses
+  the typesafe client through `typesafe.NewSystemOne`. That client now sends
+  no `Authorization` header when it has no key, omits an empty `model`, and
+  takes a `MaxSuspectsPerCall` option. The typesafe judge itself is unchanged
+  and still refuses to start without a key.
 
 ## [0.1.1] - 2026-09-26
 

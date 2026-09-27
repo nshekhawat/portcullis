@@ -37,6 +37,10 @@ import (
 // Name identifies this judge in audit records and metrics.
 const Name = "typesafe"
 
+// SystemOneName identifies a Client built with NewSystemOne: the same wire
+// format, served by someone other than TypeSafe.
+const SystemOneName = "systemone"
+
 // systemOnePath is the evaluation endpoint (TypeSafe API reference).
 const systemOnePath = "/v1/systemone"
 
@@ -44,7 +48,8 @@ const systemOnePath = "/v1/systemone"
 const questionChoice = "choice"
 
 const (
-	// maxSuspectsPerCall bounds one request (spec §5.6).
+	// maxSuspectsPerCall bounds one request (spec §5.6), and is the default of
+	// Options.MaxSuspectsPerCall.
 	maxSuspectsPerCall = 25
 	// defaultMaxStateTokens is the state budget of one request, in estimated
 	// tokens.
@@ -109,6 +114,10 @@ type Options struct {
 	// MaxStateTokens bounds the estimated serialized size of one request; a
 	// batch is split while the estimate exceeds it. Zero uses 24000.
 	MaxStateTokens int
+	// MaxSuspectsPerCall bounds the suspects in one request. Zero, or anything
+	// above 25, uses 25. Small self-hosted models answer markedly better with
+	// one suspect per state.
+	MaxSuspectsPerCall int
 }
 
 // Usage is the token accounting of the most recent Judge call: the sum over the
@@ -126,6 +135,7 @@ type Usage struct {
 // is the usage of the last call, behind a mutex, so the controller may call it
 // from one cycle at a time while another goroutine reads Usage.
 type Client struct {
+	name             string
 	baseURL          string
 	apiKey           string
 	model            string
@@ -133,6 +143,7 @@ type Client struct {
 	sendSampledPaths bool
 	http             *http.Client
 	maxStateTokens   int
+	perCall          int
 
 	mu    sync.Mutex
 	usage Usage
@@ -145,6 +156,7 @@ type Client struct {
 //nolint:gocritic // a value Options keeps New(Options{...}) readable at call sites
 func New(opts Options) *Client {
 	c := &Client{
+		name:             Name,
 		baseURL:          strings.TrimRight(opts.BaseURL, "/"),
 		apiKey:           opts.APIKey,
 		model:            opts.Model,
@@ -152,6 +164,10 @@ func New(opts Options) *Client {
 		sendSampledPaths: opts.SendSampledPaths,
 		http:             opts.HTTPClient,
 		maxStateTokens:   opts.MaxStateTokens,
+		perCall:          opts.MaxSuspectsPerCall,
+	}
+	if c.perCall <= 0 || c.perCall > maxSuspectsPerCall {
+		c.perCall = maxSuspectsPerCall
 	}
 	if c.baseURL == "" {
 		c.baseURL = defaultBaseURL
@@ -171,8 +187,24 @@ func New(opts Options) *Client {
 	return c
 }
 
-// Name returns "typesafe".
-func (c *Client) Name() string { return Name }
+// NewSystemOne returns a Client for any other server that implements the System
+// One API, such as a self-hosted jev-style server or an internal gateway. It
+// assumes nothing about the provider: BaseURL is required, an empty Model is
+// left out of the request so the server answers with its own, and an empty
+// APIKey sends no Authorization header. The judge reports itself as
+// "systemone".
+//
+//nolint:gocritic // a value Options keeps NewSystemOne(Options{...}) readable at call sites
+func NewSystemOne(opts Options) *Client {
+	c := New(opts)
+	c.name = SystemOneName
+	c.baseURL = strings.TrimRight(opts.BaseURL, "/")
+	c.model = opts.Model
+	return c
+}
+
+// Name returns "typesafe", or "systemone" for a Client built with NewSystemOne.
+func (c *Client) Name() string { return c.name }
 
 // Usage returns the token usage of the most recent Judge call, which is what the
 // controller charges against the daily budget.
@@ -191,7 +223,7 @@ func (c *Client) InputTokens() int64 {
 
 // request is the System One request body (TypeSafe API reference).
 type request struct {
-	Model     string              `json:"model"`
+	Model     string              `json:"model,omitempty"`
 	State     state               `json:"state"`
 	Questions map[string]question `json:"questions"`
 }
@@ -287,14 +319,14 @@ func (c *Client) Judge(ctx context.Context, suspects []detect.Suspect) ([]judge.
 }
 
 // batches splits suspects into requests that respect both limits: at most
-// maxSuspectsPerCall suspects, and at most maxStateTokens estimated tokens. A
+// perCall suspects, and at most maxStateTokens estimated tokens. A
 // single suspect is always sent however large it is; dropping one would silently
 // lose a verdict the controller expects, and the budget holds with a wide margin
 // at the sizes detection produces (spec §5.6).
 func (c *Client) batches(suspects []detect.Suspect) ([][]detect.Suspect, error) {
 	var batches [][]detect.Suspect
 	for start := 0; start < len(suspects); {
-		size := min(maxSuspectsPerCall, len(suspects)-start)
+		size := min(c.perCall, len(suspects)-start)
 		for size > 1 {
 			body, err := c.encode(suspects[start : start+size])
 			if err != nil {
@@ -336,7 +368,7 @@ func (c *Client) encode(suspects []detect.Suspect) ([]byte, error) {
 
 	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("typesafe: encode request: %w", err)
+		return nil, fmt.Errorf("%s: encode request: %w", c.name, err)
 	}
 	return body, nil
 }
@@ -375,26 +407,30 @@ func (c *Client) call(ctx context.Context, body []byte) (*response, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+systemOnePath, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("typesafe: build request: %w", err)
+		return nil, fmt.Errorf("%s: build request: %w", c.name, err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	// A self-hosted System One server may run without auth. The typesafe
+	// judge never gets here without a key: startup refuses it (M6).
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("typesafe: %w", err)
+		return nil, fmt.Errorf("%s: %w", c.name, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
-		return nil, newHTTPError(resp.StatusCode, resp.Header, snippet)
+		return nil, newHTTPError(c.name, resp.StatusCode, resp.Header, snippet)
 	}
 
 	var out response
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("typesafe: decode response: %w", err)
+		return nil, fmt.Errorf("%s: decode response: %w", c.name, err)
 	}
 	return &out, nil
 }
@@ -428,7 +464,7 @@ func (c *Client) verdicts(resp *response, suspects []detect.Suspect) []judge.Ver
 			Label:         label,
 			Confidence:    *a.Confidence,
 			Probabilities: probabilities(a.Probabilities),
-			Judge:         Name,
+			Judge:         c.name,
 			Model:         model,
 		})
 	}
@@ -483,6 +519,8 @@ func (c *Client) addUsage(resp *response) {
 // RateLimitError reports a throttled call. There is no retry inside the cycle:
 // the next cycle is the retry (spec §5.6).
 type RateLimitError struct {
+	// Judge is the judge that was throttled, "typesafe" when empty.
+	Judge string
 	// StatusCode is the HTTP status, 429.
 	StatusCode int
 	// RetryAfter is the delay the server asked for, and zero when it did not
@@ -493,13 +531,15 @@ type RateLimitError struct {
 // Error implements error. It carries no key and no identity.
 func (e *RateLimitError) Error() string {
 	if e.RetryAfter > 0 {
-		return fmt.Sprintf("typesafe: rate limited (%d), retry after %s", e.StatusCode, e.RetryAfter)
+		return fmt.Sprintf("%s: rate limited (%d), retry after %s", judgeOr(e.Judge), e.StatusCode, e.RetryAfter)
 	}
-	return fmt.Sprintf("typesafe: rate limited (%d)", e.StatusCode)
+	return fmt.Sprintf("%s: rate limited (%d)", judgeOr(e.Judge), e.StatusCode)
 }
 
 // HTTPError reports any other non-2xx response.
 type HTTPError struct {
+	// Judge is the judge whose call failed, "typesafe" when empty.
+	Judge string
 	// StatusCode is the HTTP status the server returned.
 	StatusCode int
 	// Body is a truncated, whitespace-trimmed copy of the response body.
@@ -509,17 +549,25 @@ type HTTPError struct {
 // Error implements error. It carries no key and no identity.
 func (e *HTTPError) Error() string {
 	if e.Body == "" {
-		return fmt.Sprintf("typesafe: unexpected status %d", e.StatusCode)
+		return fmt.Sprintf("%s: unexpected status %d", judgeOr(e.Judge), e.StatusCode)
 	}
-	return fmt.Sprintf("typesafe: unexpected status %d: %s", e.StatusCode, e.Body)
+	return fmt.Sprintf("%s: unexpected status %d: %s", judgeOr(e.Judge), e.StatusCode, e.Body)
+}
+
+// judgeOr names the judge in an error message, defaulting to "typesafe".
+func judgeOr(name string) string {
+	if name == "" {
+		return Name
+	}
+	return name
 }
 
 // newHTTPError classifies a non-2xx response.
-func newHTTPError(status int, header http.Header, body []byte) error {
+func newHTTPError(judgeName string, status int, header http.Header, body []byte) error {
 	if status == http.StatusTooManyRequests {
-		return &RateLimitError{StatusCode: status, RetryAfter: retryAfter(header)}
+		return &RateLimitError{Judge: judgeName, StatusCode: status, RetryAfter: retryAfter(header)}
 	}
-	return &HTTPError{StatusCode: status, Body: strings.TrimSpace(string(body))}
+	return &HTTPError{Judge: judgeName, StatusCode: status, Body: strings.TrimSpace(string(body))}
 }
 
 // retryAfter reads the Retry-After header, falling back to the retry-after-ms

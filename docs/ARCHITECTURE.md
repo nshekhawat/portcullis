@@ -44,7 +44,7 @@ request ──► │ client-IP resolve → tier lookup (in-mem) → token bucke
             └───────────────────────────────────────────────────────────────────────┘
                                         │ ≤ 25 suspects / call
             ┌──────────── JUDGMENT PLANE (async, bounded, fail-static) ─────────────┐
-            │ Judge (typesafe | rules | mock) → verdict + confidence                │
+            │ Judge (typesafe | systemone | openai | rules | mock) → verdict + conf.│
             │ → policy matrix → GUARDRAILS → tier store (TTL) → audit record        │
             └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -92,8 +92,13 @@ Deterministic and auditable: the same windows always produce the same suspects.
 Asynchronous, bounded and fail-static:
 
 - **Judges** all share one closed label set and one literal set of criteria
-  texts. `typesafe` is the external client; `rules` is the offline, deterministic
-  fallback; `mock` is for tests.
+  texts. `typesafe` is the external client. `systemone` is the same System
+  One client pointed at any other compatible server, such as a self-hosted
+  jev-style server. `openai` drives an OpenAI-compatible server in one of two
+  formats: `json_schema` for chat models, or `jevstyle`, which sends a
+  Jev-style decision model its own prompt and reads calibrated probabilities
+  from token logprobs. `rules` is the offline, deterministic fallback; `mock`
+  is for tests.
 - **Budget** caps calls per minute (dogfooding our own token bucket) and input
   tokens per day.
 - **Circuit breaker** trips after consecutive failures and stays open for
