@@ -17,6 +17,7 @@ import (
 	"github.com/nshekhawat/portcullis/internal/detect"
 	"github.com/nshekhawat/portcullis/internal/judge"
 	"github.com/nshekhawat/portcullis/internal/judge/mock"
+	"github.com/nshekhawat/portcullis/internal/judge/openai"
 	"github.com/nshekhawat/portcullis/internal/judge/rules"
 	"github.com/nshekhawat/portcullis/internal/judge/typesafe"
 	"github.com/nshekhawat/portcullis/internal/metrics"
@@ -293,6 +294,12 @@ func buildJudge(cfg *config.Config, logger *zap.Logger) (judge.Judge, error) {
 			SendSampledPaths: cfg.Judgment.TypeSafe.SendSampledPaths,
 		}), nil
 
+	case config.JudgeOpenAI:
+		return buildOpenAIJudge(cfg, "judgment.judge", logger)
+
+	case config.JudgeSystemOne:
+		return buildSystemOneJudge(cfg, "judgment.judge", logger)
+
 	case config.JudgeMock:
 		logger.Warn("the mock judge is for tests; it returns a fixed label")
 		return mock.NewWithLabel(judge.LabelLegitimateBurst, 0.5), nil
@@ -327,12 +334,80 @@ func buildFallbackJudge(cfg *config.Config, logger *zap.Logger) (judge.Judge, er
 			Model:   cfg.Judgment.TypeSafe.Model,
 			Timeout: cfg.Judgment.Timeout,
 		}), nil
+	case config.JudgeOpenAI:
+		return buildOpenAIJudge(cfg, "judgment.fallback_judge", logger)
+	case config.JudgeSystemOne:
+		return buildSystemOneJudge(cfg, "judgment.fallback_judge", logger)
 	case config.JudgeMock:
 		logger.Warn("the mock judge is for tests; it returns a fixed label")
 		return mock.NewWithLabel(judge.LabelLegitimateBurst, 0.5), nil
 	default:
 		return nil, fmt.Errorf("unknown fallback judge %q", cfg.Judgment.FallbackJudge)
 	}
+}
+
+// buildOpenAIJudge constructs the OpenAI-compatible judge. Auth is optional: an
+// empty api_key_env sends no Authorization header, which is what a local LM
+// Studio or Ollama expects.
+func buildOpenAIJudge(cfg *config.Config, field string, logger *zap.Logger) (judge.Judge, error) {
+	oc := cfg.Judgment.OpenAI
+	apiKey, err := optionalAPIKey(field, config.JudgeOpenAI, "judgment.openai.api_key_env", oc.APIKeyEnv)
+	if err != nil {
+		return nil, err
+	}
+	if oc.Format == config.OpenAIFormatJevStyle {
+		logger.Info("openai-compatible judge in jevstyle format: the server must return top_logprobs",
+			zap.String("base_url", oc.BaseURL), zap.String("model", oc.Model))
+	} else {
+		logger.Info("openai-compatible judge: self-reported confidences are not calibrated; re-tune judgment.policy in shadow mode before enforcing",
+			zap.String("base_url", oc.BaseURL), zap.String("model", oc.Model))
+	}
+	return openai.New(openai.Options{
+		BaseURL:                oc.BaseURL,
+		APIKey:                 apiKey,
+		Model:                  oc.Model,
+		Format:                 oc.Format,
+		CalibrationTemperature: oc.CalibrationTemperature,
+		Timeout:                cfg.Judgment.Timeout,
+		SendSampledPaths:       oc.SendSampledPaths,
+		MaxSuspectsPerCall:     oc.MaxSuspectsPerCall,
+	}), nil
+}
+
+// buildSystemOneJudge constructs a System One client for a server other than
+// TypeSafe. Auth works as for the openai judge: optional, but a named variable
+// must be set.
+func buildSystemOneJudge(cfg *config.Config, field string, logger *zap.Logger) (judge.Judge, error) {
+	sc := cfg.Judgment.SystemOne
+	apiKey, err := optionalAPIKey(field, config.JudgeSystemOne, "judgment.systemone.api_key_env", sc.APIKeyEnv)
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("systemone judge: judgment.policy is tuned against TypeSafe's Jev; re-tune in shadow mode before enforcing",
+		zap.String("base_url", sc.BaseURL), zap.String("model", sc.Model))
+	return typesafe.NewSystemOne(typesafe.Options{
+		BaseURL:            sc.BaseURL,
+		APIKey:             apiKey,
+		Model:              sc.Model,
+		Timeout:            cfg.Judgment.Timeout,
+		SendSampledPaths:   sc.SendSampledPaths,
+		MaxSuspectsPerCall: sc.MaxSuspectsPerCall,
+	}), nil
+}
+
+// optionalAPIKey reads a bearer token for a judge whose auth is optional. An
+// empty envName means no auth. A named variable that is unset is an error, for
+// the same reason as the typesafe judge (M6): the operator asked for auth, and
+// silently dropping it would only surface later as a stream of 401s.
+func optionalAPIKey(field, judgeName, keyField, envName string) (string, error) {
+	if envName == "" {
+		return "", nil
+	}
+	if key := os.Getenv(envName); key != "" {
+		return key, nil
+	}
+	return "", fmt.Errorf("%s is %q but %s is not set (leave %s empty for a server without auth)",
+		field, judgeName, envName, keyField)
 }
 
 // loadScannerPaths reads an optional scanner-path override file, one path per

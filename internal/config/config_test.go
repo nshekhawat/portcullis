@@ -242,6 +242,67 @@ func TestConfig_Validate(t *testing.T) {
 			},
 		},
 		{
+			name: "openai invalid format",
+			modifier: func(c *Config) {
+				c.Judgment.Judge = JudgeOpenAI
+				c.Judgment.OpenAI.Model = "m"
+				c.Judgment.OpenAI.Format = "xml"
+			},
+			expectError: true,
+			errorMsg:    "invalid judgment openai.format",
+		},
+		{
+			name:     "systemone judge with defaults",
+			modifier: func(c *Config) { c.Judgment.Judge = JudgeSystemOne },
+		},
+		{
+			name: "systemone judge without base_url",
+			modifier: func(c *Config) {
+				c.Judgment.FallbackJudge = JudgeSystemOne
+				c.Judgment.SystemOne.BaseURL = ""
+			},
+			expectError: true,
+			errorMsg:    "systemone.base_url is required",
+		},
+		{
+			name: "systemone batch above 25",
+			modifier: func(c *Config) {
+				c.Judgment.Judge = JudgeSystemOne
+				c.Judgment.SystemOne.MaxSuspectsPerCall = 26
+			},
+			expectError: true,
+			errorMsg:    "systemone.max_suspects_per_call",
+		},
+		{
+			name:        "openai judge without model",
+			modifier:    func(c *Config) { c.Judgment.Judge = JudgeOpenAI },
+			expectError: true,
+			errorMsg:    "openai.model is required",
+		},
+		{
+			name: "openai fallback without base_url",
+			modifier: func(c *Config) {
+				c.Judgment.FallbackJudge = JudgeOpenAI
+				c.Judgment.OpenAI.Model = "m"
+				c.Judgment.OpenAI.BaseURL = ""
+			},
+			expectError: true,
+			errorMsg:    "openai.base_url is required",
+		},
+		{
+			name: "openai judge with model",
+			modifier: func(c *Config) {
+				c.Judgment.Judge = JudgeOpenAI
+				c.Judgment.OpenAI.Model = "m"
+			},
+		},
+		{
+			name: "openai section ignored when unused",
+			modifier: func(c *Config) {
+				c.Judgment.OpenAI = OpenAIConfig{}
+			},
+		},
+		{
 			name: "invalid log format",
 			modifier: func(c *Config) {
 				c.Logging.Format = "xml"
@@ -368,6 +429,46 @@ logging:
 	assert.Equal(t, "/custom-metrics", cfg.Metrics.Path)
 	assert.Equal(t, "debug", cfg.Logging.Level)
 	assert.Equal(t, "console", cfg.Logging.Format)
+}
+
+func TestLoad_OpenAIJudge(t *testing.T) {
+	configPath := writeConfig(t, `
+judgment:
+  judge: openai
+  openai:
+    base_url: http://192.168.1.20:11434/v1
+    model: qwen3:4b
+    max_suspects_per_call: 5
+`)
+	cfg, err := Load(configPath)
+	require.NoError(t, err)
+	assert.Equal(t, JudgeOpenAI, cfg.Judgment.Judge)
+	assert.Equal(t, "http://192.168.1.20:11434/v1", cfg.Judgment.OpenAI.BaseURL)
+	assert.Equal(t, "qwen3:4b", cfg.Judgment.OpenAI.Model)
+	assert.Empty(t, cfg.Judgment.OpenAI.APIKeyEnv)
+	assert.Equal(t, 5, cfg.Judgment.OpenAI.MaxSuspectsPerCall)
+	assert.True(t, cfg.Judgment.OpenAI.SendSampledPaths)
+	assert.Equal(t, OpenAIFormatJSONSchema, cfg.Judgment.OpenAI.Format)
+}
+
+func TestLoad_SystemOneJudge(t *testing.T) {
+	configPath := writeConfig(t, `
+judgment:
+  judge: systemone
+  systemone:
+    base_url: http://10.0.0.5:8765
+    api_key_env: JEV_KEY
+  openai:
+    format: jevstyle
+`)
+	cfg, err := Load(configPath)
+	require.NoError(t, err)
+	assert.Equal(t, JudgeSystemOne, cfg.Judgment.Judge)
+	assert.Equal(t, "http://10.0.0.5:8765", cfg.Judgment.SystemOne.BaseURL)
+	assert.Equal(t, "JEV_KEY", cfg.Judgment.SystemOne.APIKeyEnv)
+	assert.Empty(t, cfg.Judgment.SystemOne.Model)
+	assert.Equal(t, 1, cfg.Judgment.SystemOne.MaxSuspectsPerCall)
+	assert.Equal(t, OpenAIFormatJevStyle, cfg.Judgment.OpenAI.Format)
 }
 
 func TestLoad_FromEnv(t *testing.T) {

@@ -130,13 +130,48 @@ ratelimit:
     login: { capacity: 10, refill_rate: 10, period: 1m }
 judgment:
   mode: shadow                       # off | shadow | enforce
-  judge: typesafe                    # rules | typesafe | mock
+  judge: typesafe                    # rules | typesafe | openai | mock
   policy:
     l7_flood: [ { min_confidence: 0.8, tier: block }, { min_confidence: 0.6, tier: strict } ]
   guardrails:
     block_min_confidence: 0.9
     block_requires_hard_evidence: true
 ```
+
+### Self-hosted and third-party models
+
+Besides TypeSafe, three judges run on models you host yourself. Auth is
+optional for all three: leave `api_key_env` empty, or name an environment
+variable that holds a bearer token.
+
+| `judgment.judge` | Talks to | Use it for |
+|---|---|---|
+| `systemone` | any server speaking TypeSafe's `POST /v1/systemone` API, such as a local [`jev-style serve`](https://github.com/lawrence3699/jev-style) | calibrated Jev-style decisions with no glue code |
+| `openai` + `format: jevstyle` | an OpenAI-compatible server that returns `top_logprobs` (LM Studio with a **GGUF** build, llama.cpp) | Jev-style decision models such as `chaoliangUNSW/Jev-Style-*-Decision` |
+| `openai` (default `format: json_schema`) | any OpenAI-compatible server (LM Studio, Ollama, vLLM) | general chat models; confidence is self-reported |
+
+```yaml
+judgment:
+  judge: systemone
+  timeout: 30s                         # local models need more than the 2s default
+  systemone:
+    base_url: http://127.0.0.1:8765    # `jev-style serve`
+    api_key_env: ""
+    max_suspects_per_call: 1
+```
+
+```yaml
+judgment:
+  judge: openai
+  timeout: 60s
+  openai:
+    base_url: http://localhost:1234/v1 # LM Studio; Ollama is http://localhost:11434/v1
+    model: jev-style-v2-calibrated     # the GGUF build's id from GET /v1/models
+    format: jevstyle
+```
+
+See [docs/OPERATIONS.md](docs/OPERATIONS.md#self-hosted-judges) for setup,
+the caveats, and measured results.
 
 Note that `refill_rate` is **tokens per `period`**: `refill_rate: 10, period: 1m`
 is ten per minute, and `capacity` is the burst.

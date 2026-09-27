@@ -44,7 +44,8 @@ request path, the request is denied and answered `503`, not `429`.
 
 ## Data sent externally
 
-With `judgment.judge: typesafe`, one call carries, per suspect:
+With `judgment.judge: typesafe` (and likewise `systemone` and `openai`, see
+[Self-hosted judges](#self-hosted-judges)), one call carries, per suspect:
 
 - an opaque `SuspectID` (`s00`…`s24`) — the only identifier that leaves,
 - bucketed features (rate, ratios, timing regularity, route diversity, method
@@ -59,6 +60,159 @@ asserts this at the wire level (`TestRequest_NoIdentityLeak`).
 The TypeSafe DPA and ZDR (enterprise) apply to whatever is sent. In strict
 environments set `send_sampled_paths: false`, which removes the only
 free-text field.
+
+## Self-hosted judges
+
+Three judges run on models you host yourself. All of them send the same
+identity-free state as the typesafe judge. None of them sends data outside
+your network unless `base_url` points outside it. Auth is optional for all
+three: an empty `api_key_env` sends no `Authorization` header. A named
+variable that is unset fails startup rather than silently dropping auth.
+
+| `judgment.judge` | Server | Confidence |
+|---|---|---|
+| `systemone` | anything speaking `POST /v1/systemone`: a local [`jev-style serve`](https://github.com/lawrence3699/jev-style), an internal gateway | from the server (calibrated for Jev-style models) |
+| `openai`, `format: jevstyle` | OpenAI-compatible server that returns `top_logprobs`: LM Studio (GGUF engine), llama.cpp `llama-server` | calibrated: read from the option-letter probabilities |
+| `openai`, `format: json_schema` | any OpenAI-compatible server: LM Studio, Ollama, vLLM | self-reported by the model; not calibrated |
+
+Whichever you pick, three things apply:
+
+- **Re-tune before enforcing.** `judgment.policy` is tuned against TypeSafe's
+  pinned Jev. Run in `shadow` and compare `admin decisions` against ground
+  truth first. Every guardrail still applies, including
+  `block_requires_hard_evidence`.
+- **Raise `judgment.timeout`.** The 2s default covers one TypeSafe call; a
+  local judge takes one call per suspect. At about 0.4–0.7s per decision, 25
+  suspects need 15–20s. If the timeout is too short, every cycle times out
+  and the breaker opens. The data plane is unaffected either way.
+- **Keep `budget.max_calls_per_minute` within what the box can serve.**
+
+### `systemone`: any System One server
+
+```yaml
+judgment:
+  judge: systemone
+  timeout: 30s
+  systemone:
+    base_url: http://127.0.0.1:8765  # scheme://host:port; the client appends /v1/systemone
+    api_key_env: ""                  # or the variable holding the server's bearer token
+    model: ""                        # "" = the server's own model
+    send_sampled_paths: true
+    max_suspects_per_call: 1         # 1..25
+```
+
+To run the reference server locally (Apple silicon; use `[torch]` elsewhere):
+
+```bash
+uv venv jevstyle && VIRTUAL_ENV=jevstyle uv pip install "jev-style[mlx]"
+jevstyle/bin/jev-style serve --precision 8bit      # http://127.0.0.1:8765, auth off
+# with auth: JEV_KEY=... jev-style serve --api-key-env JEV_KEY
+```
+
+**Keep `max_suspects_per_call: 1` for small models.** Measured on 2026-09-26
+with `jev-style-0.8b-decision-v3` (MLX, 8-bit) and the three canned suspects
+from the live test:
+
+| Per call | flood | scanner | burst | Latency |
+|---|---|---|---|---|
+| 3 suspects in one state | `l7_flood` 0.31 | `l7_flood` 0.20 ✗ | `l7_flood` 0.15 ✗ | 1.5s |
+| 1 suspect per state | `l7_flood` 0.31 | `vulnerability_scanner` 0.33 | `legitimate_burst` 0.39 | 1.2s |
+
+This server's `confidence` is lower than its top probability. For the flood,
+p(`l7_flood`) was 0.39 while `confidence` was 0.31. Portcullis acts on
+`confidence`, so expect to lower `judgment.policy` floors for this server.
+Re-tune; don't guess.
+
+### `openai` with `format: jevstyle`: Jev-style models in LM Studio
+
+A Jev-style decision model (for example `chaoliangUNSW/Jev-Style-*-Decision`)
+is not a chat model. It has to be sent its own prompt format, and it answers
+with one option letter, whose probability is the decision:
+
+```
+You are a decision function. Read the state, then answer the question by choosing exactly one option.
+
+[State]
+Traffic summary for one API client ... request_rate: extreme ...
+
+[Question]
+Which behavior best describes this API client?
+
+[Options]
+A. legitimate_burst: <criteria>
+...
+H. l7_flood: <criteria>
+
+Answer:
+```
+
+The judge sends that prompt once per suspect, with `max_tokens: 1`,
+`logprobs: true` and `top_logprobs: 20`. It then renormalizes the log-probs of
+letters A–H into a distribution over the labels. This is the method of the
+model's reference `jev_style_client.py`. A letter missing from the 20
+returned candidates gets a floor 5 nats below the weakest candidate, which is
+negligible mass. A response with no letter at all produces no verdict.
+
+```yaml
+judgment:
+  judge: openai
+  timeout: 60s
+  openai:
+    base_url: http://localhost:1234/v1
+    model: jev-style-qwen3.5-2b-decision-v2   # the GGUF build
+    format: jevstyle
+    calibration_temperature: 1.0              # the "temperature" in the build's calibration.json
+```
+
+**Load the GGUF build, not MLX.** LM Studio's MLX engine returns no
+`logprobs`, so the MLX build answers with a bare letter and no confidence. The
+judge treats that as an error (`jevstyle format needs token logprobs`) instead
+of inventing a confidence. The GGUF build returns them:
+
+```bash
+lms get "https://huggingface.co/chaoliangUNSW/Jev-Style-Qwen3.5-2B-Decision-v2-GGUF@Q4_K_M" --gguf
+lms load jev-style-qwen3.5-2b-decision-v2
+```
+
+The v2 GGUF builds fold calibration into the weights (`temperature_folded:
+true`, runtime temperature 1.0). A build that does not should have its
+`calibration.json` temperature set in `calibration_temperature`.
+
+Measured on 2026-09-26 against LM Studio with the v2 Q4_K_M GGUF: 3 suspects in
+2.2s, 1,362 input tokens. The flood came back `l7_flood` 0.74, the scanner
+`vulnerability_scanner` 0.66, and the credential stuffer `l7_flood` 0.38
+(wrong, but below `min_confidence_to_act`, so at most `watch`).
+
+### `openai` with `format: json_schema`: general chat models
+
+For ordinary chat models (Qwen, Llama, …) on LM Studio, Ollama
+(`http://<host>:11434/v1`) or vLLM (`http://<host>:8000/v1`). A system message
+carries the context sentence and the literal label criteria, and the user
+message holds the suspects as JSON. The request sets `response_format: {type:
+json_schema}` with the batch's suspect ids as required keys and the label set
+as an enum, so a server that enforces the schema cannot invent a suspect or a
+label. If a server ignores the schema, the reply is still decoded strictly: a
+`<think>` preamble or code fence is stripped, and any answer that is missing,
+out of range, or unknown is dropped. The model's `confidence` is just a
+number it chose, so treat it as uncalibrated. Do not use this format for a
+Jev-style model: given a chat-style prompt, the 2B model labeled a flood, a
+scanner and a credential stuffer all `scraper` at 0.95–1.0.
+
+### Live tests
+
+```bash
+# systemone (any System One server)
+SYSTEMONE_BASE_URL=http://127.0.0.1:8765 \
+go test -tags live -v -count=1 ./internal/judge/typesafe -run TestLiveSystemOne
+
+# openai; OPENAI_JUDGE_FORMAT=jevstyle for a Jev-style model
+OPENAI_JUDGE_BASE_URL=http://localhost:1234/v1 \
+OPENAI_JUDGE_MODEL=jev-style-qwen3.5-2b-decision-v2 OPENAI_JUDGE_FORMAT=jevstyle \
+go test -tags live -v -count=1 ./internal/judge/openai -run TestLive
+```
+
+Both check the contract (labels inside the closed set, confidences in [0, 1])
+and log each verdict with its latency. They do not grade the labels.
 
 ## Cost
 
@@ -193,6 +347,11 @@ otherwise change what the deployment enforces while it still reported healthy.
   changes the reachable tiers. To run offline, set `judge: rules` explicitly.
   The same applies to `fallback_judge: typesafe`; leave `fallback_judge` empty
   if you want no fallback.
+- **`judge: openai` without `judgment.openai.model`**, or `judge: openai` or
+  `systemone` with an `api_key_env` that names an unset variable. An empty
+  `api_key_env` is fine and means "no auth". Naming a variable means you
+  expect auth, so a missing value fails startup instead of turning into a
+  stream of 401s.
 - **`judgment.policy` lists out of order.** Each label's rules must descend by
   `min_confidence`, because the first rule a verdict clears is the one that
   applies. An ascending list would silently match the loosest rule forever.

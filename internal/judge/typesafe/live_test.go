@@ -94,3 +94,43 @@ func envOr(name, fallback string) string {
 	}
 	return fallback
 }
+
+// TestLiveSystemOne runs the same canned suspects against any other System One
+// server, such as a self-hosted jev-style server. It runs only when
+// SYSTEMONE_BASE_URL is set; SYSTEMONE_API_KEY and SYSTEMONE_MODEL are
+// optional:
+//
+//	jev-style serve   # http://127.0.0.1:8765
+//	SYSTEMONE_BASE_URL=http://127.0.0.1:8765 go test -tags live -v ./internal/judge/typesafe -run TestLiveSystemOne
+//
+// Latency is logged, not asserted: local hardware varies.
+func TestLiveSystemOne(t *testing.T) {
+	baseURL := os.Getenv("SYSTEMONE_BASE_URL")
+	if baseURL == "" {
+		t.Skip("SYSTEMONE_BASE_URL is not set: skipping the live System One test")
+	}
+
+	client := NewSystemOne(Options{
+		BaseURL:            baseURL,
+		APIKey:             os.Getenv("SYSTEMONE_API_KEY"),
+		Model:              os.Getenv("SYSTEMONE_MODEL"),
+		MaxSuspectsPerCall: 1,
+		Timeout:            time.Minute,
+		SendSampledPaths:   true,
+	})
+
+	start := time.Now()
+	verdicts, err := client.Judge(context.Background(), []detect.Suspect{floodSuspect(), scannerSuspect("s01"), burstSuspect("s02")})
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	require.NotEmpty(t, verdicts)
+
+	for i := range verdicts {
+		v := &verdicts[i]
+		assert.Contains(t, judge.Labels(), v.Label)
+		assert.Equal(t, SystemOneName, v.Judge)
+		t.Logf("suspect=%s label=%s confidence=%.2f", v.SuspectID, v.Label, v.Confidence)
+	}
+	usage := client.Usage()
+	t.Logf("model=%s input_tokens=%d latency=%s verdicts=%d", usage.Model, usage.InputTokens, elapsed, len(verdicts))
+}

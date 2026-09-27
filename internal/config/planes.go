@@ -20,9 +20,17 @@ const (
 
 // Judge implementations.
 const (
-	JudgeRules    = "rules"
-	JudgeTypeSafe = "typesafe"
-	JudgeMock     = "mock"
+	JudgeRules     = "rules"
+	JudgeTypeSafe  = "typesafe"
+	JudgeMock      = "mock"
+	JudgeOpenAI    = "openai"
+	JudgeSystemOne = "systemone"
+)
+
+// Prompt formats of the openai judge.
+const (
+	OpenAIFormatJSONSchema = "json_schema"
+	OpenAIFormatJevStyle   = "jevstyle"
 )
 
 // SignalsConfig configures the observation pipeline.
@@ -60,6 +68,8 @@ type JudgmentConfig struct {
 	Budget         BudgetConfig                 `mapstructure:"budget"`
 	CircuitBreaker CircuitBreakerConfig         `mapstructure:"circuit_breaker"`
 	TypeSafe       TypeSafeConfig               `mapstructure:"typesafe"`
+	OpenAI         OpenAIConfig                 `mapstructure:"openai"`
+	SystemOne      SystemOneConfig              `mapstructure:"systemone"`
 	Policy         map[string][]PolicyRule      `mapstructure:"policy"`
 	MinConfidence  float64                      `mapstructure:"min_confidence_to_act"`
 	Tiers          map[string]policy.TierConfig `mapstructure:"tiers"`
@@ -85,6 +95,43 @@ type TypeSafeConfig struct {
 	APIKeyEnv        string `mapstructure:"api_key_env"`
 	Model            string `mapstructure:"model"`
 	SendSampledPaths bool   `mapstructure:"send_sampled_paths"`
+}
+
+// OpenAIConfig configures the judge for self-hosted or third-party models that
+// speak the OpenAI chat-completions API (LM Studio, Ollama, vLLM, ...).
+type OpenAIConfig struct {
+	// BaseURL is scheme, host, port and API version, such as
+	// http://localhost:1234/v1.
+	BaseURL string `mapstructure:"base_url"`
+	// APIKeyEnv names the environment variable holding a bearer token. Empty
+	// means the server needs no auth and no Authorization header is sent.
+	APIKeyEnv string `mapstructure:"api_key_env"`
+	Model     string `mapstructure:"model"`
+	// Format is how the model is asked: json_schema for a general chat model,
+	// or jevstyle for a Jev-style decision model read through token logprobs.
+	Format string `mapstructure:"format"`
+	// CalibrationTemperature divides the option-letter logits in the jevstyle
+	// format. 1 (the default) suits builds that fold calibration into the
+	// weights.
+	CalibrationTemperature float64 `mapstructure:"calibration_temperature"`
+	SendSampledPaths       bool    `mapstructure:"send_sampled_paths"`
+	MaxSuspectsPerCall     int     `mapstructure:"max_suspects_per_call"`
+}
+
+// SystemOneConfig configures a System One-compatible server other than
+// TypeSafe, such as a self-hosted jev-style server. Unlike the typesafe block,
+// auth and model are optional.
+type SystemOneConfig struct {
+	BaseURL string `mapstructure:"base_url"`
+	// APIKeyEnv names the environment variable holding a bearer token. Empty
+	// means no Authorization header.
+	APIKeyEnv string `mapstructure:"api_key_env"`
+	// Model is sent when set; empty lets the server use its own.
+	Model            string `mapstructure:"model"`
+	SendSampledPaths bool   `mapstructure:"send_sampled_paths"`
+	// MaxSuspectsPerCall bounds one request, at most 25. The default of 1
+	// suits small local models, which confuse suspects in a shared state.
+	MaxSuspectsPerCall int `mapstructure:"max_suspects_per_call"`
 }
 
 // PolicyRule maps a label and confidence floor onto a tier.
@@ -154,6 +201,18 @@ func DefaultJudgmentConfig() JudgmentConfig {
 			Model:            "jev-1.13.0",
 			SendSampledPaths: true,
 		},
+		OpenAI: OpenAIConfig{
+			BaseURL:                "http://localhost:1234/v1",
+			Format:                 OpenAIFormatJSONSchema,
+			CalibrationTemperature: 1,
+			SendSampledPaths:       true,
+			MaxSuspectsPerCall:     25,
+		},
+		SystemOne: SystemOneConfig{
+			BaseURL:            "http://127.0.0.1:8765",
+			SendSampledPaths:   true,
+			MaxSuspectsPerCall: 1,
+		},
 		Policy:        defaultPolicy(),
 		MinConfidence: 0.6,
 		Tiers: map[string]policy.TierConfig{
@@ -220,6 +279,18 @@ func setPlaneDefaults(v *viper.Viper) {
 	v.SetDefault("judgment.typesafe.api_key_env", judgment.TypeSafe.APIKeyEnv)
 	v.SetDefault("judgment.typesafe.model", judgment.TypeSafe.Model)
 	v.SetDefault("judgment.typesafe.send_sampled_paths", judgment.TypeSafe.SendSampledPaths)
+	v.SetDefault("judgment.openai.base_url", judgment.OpenAI.BaseURL)
+	v.SetDefault("judgment.openai.api_key_env", judgment.OpenAI.APIKeyEnv)
+	v.SetDefault("judgment.openai.model", judgment.OpenAI.Model)
+	v.SetDefault("judgment.openai.format", judgment.OpenAI.Format)
+	v.SetDefault("judgment.openai.calibration_temperature", judgment.OpenAI.CalibrationTemperature)
+	v.SetDefault("judgment.openai.send_sampled_paths", judgment.OpenAI.SendSampledPaths)
+	v.SetDefault("judgment.systemone.base_url", judgment.SystemOne.BaseURL)
+	v.SetDefault("judgment.systemone.api_key_env", judgment.SystemOne.APIKeyEnv)
+	v.SetDefault("judgment.systemone.model", judgment.SystemOne.Model)
+	v.SetDefault("judgment.systemone.send_sampled_paths", judgment.SystemOne.SendSampledPaths)
+	v.SetDefault("judgment.systemone.max_suspects_per_call", judgment.SystemOne.MaxSuspectsPerCall)
+	v.SetDefault("judgment.openai.max_suspects_per_call", judgment.OpenAI.MaxSuspectsPerCall)
 	v.SetDefault("judgment.min_confidence_to_act", judgment.MinConfidence)
 	v.SetDefault("judgment.guardrails.allowlist", judgment.Guardrails.Allowlist)
 	v.SetDefault("judgment.guardrails.block_min_confidence", judgment.Guardrails.BlockMinConfidence)
@@ -265,6 +336,18 @@ func (c *Config) normalizePlanes() {
 	}
 	if c.Judgment.TypeSafe.BaseURL == "" {
 		c.Judgment.TypeSafe = def.TypeSafe
+	}
+	if c.Judgment.OpenAI.MaxSuspectsPerCall == 0 {
+		c.Judgment.OpenAI.MaxSuspectsPerCall = def.OpenAI.MaxSuspectsPerCall
+	}
+	if c.Judgment.SystemOne.MaxSuspectsPerCall == 0 {
+		c.Judgment.SystemOne.MaxSuspectsPerCall = def.SystemOne.MaxSuspectsPerCall
+	}
+	if c.Judgment.OpenAI.CalibrationTemperature == 0 {
+		c.Judgment.OpenAI.CalibrationTemperature = def.OpenAI.CalibrationTemperature
+	}
+	if c.Judgment.OpenAI.Format == "" {
+		c.Judgment.OpenAI.Format = def.OpenAI.Format
 	}
 }
 
@@ -368,6 +451,34 @@ func (c *Config) validatePlanes() error {
 	if c.Judgment.TypeSafe.Model == "" {
 		return fmt.Errorf("judgment typesafe.model is required")
 	}
+	if c.Judgment.Judge == JudgeOpenAI || c.Judgment.FallbackJudge == JudgeOpenAI {
+		if c.Judgment.OpenAI.BaseURL == "" {
+			return fmt.Errorf("judgment openai.base_url is required when the openai judge is used")
+		}
+		if c.Judgment.OpenAI.Model == "" {
+			return fmt.Errorf("judgment openai.model is required when the openai judge is used")
+		}
+		if c.Judgment.OpenAI.MaxSuspectsPerCall < 1 {
+			return fmt.Errorf("judgment openai.max_suspects_per_call must be at least 1")
+		}
+		if c.Judgment.OpenAI.CalibrationTemperature <= 0 {
+			return fmt.Errorf("judgment openai.calibration_temperature must be positive")
+		}
+		switch c.Judgment.OpenAI.Format {
+		case OpenAIFormatJSONSchema, OpenAIFormatJevStyle:
+		default:
+			return fmt.Errorf("invalid judgment openai.format %q (want %q or %q)",
+				c.Judgment.OpenAI.Format, OpenAIFormatJSONSchema, OpenAIFormatJevStyle)
+		}
+	}
+	if c.Judgment.Judge == JudgeSystemOne || c.Judgment.FallbackJudge == JudgeSystemOne {
+		if c.Judgment.SystemOne.BaseURL == "" {
+			return fmt.Errorf("judgment systemone.base_url is required when the systemone judge is used")
+		}
+		if n := c.Judgment.SystemOne.MaxSuspectsPerCall; n < 1 || n > 25 {
+			return fmt.Errorf("judgment systemone.max_suspects_per_call must be in [1, 25]")
+		}
+	}
 	if r := c.Judgment.MinConfidence; r < 0 || r > 1 {
 		return fmt.Errorf("judgment min_confidence_to_act must be in [0, 1]")
 	}
@@ -446,10 +557,10 @@ func validateJudgeName(field, name string, allowEmpty bool) error {
 		return fmt.Errorf("%s is required", field)
 	}
 	switch name {
-	case JudgeRules, JudgeTypeSafe, JudgeMock:
+	case JudgeRules, JudgeTypeSafe, JudgeSystemOne, JudgeOpenAI, JudgeMock:
 		return nil
 	default:
-		return fmt.Errorf("invalid %s %q (want %q, %q or %q)",
-			field, name, JudgeRules, JudgeTypeSafe, JudgeMock)
+		return fmt.Errorf("invalid %s %q (want %q, %q, %q, %q or %q)",
+			field, name, JudgeRules, JudgeTypeSafe, JudgeSystemOne, JudgeOpenAI, JudgeMock)
 	}
 }

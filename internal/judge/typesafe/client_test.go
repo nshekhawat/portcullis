@@ -674,3 +674,46 @@ func FuzzDecodeResponse(f *testing.F) {
 		}
 	})
 }
+
+// TestNewSystemOne covers the provider-agnostic constructor: no key means no
+// Authorization header, an empty model is left out so the server picks its own,
+// and verdicts and errors name the systemone judge.
+func TestNewSystemOne(t *testing.T) {
+	var gotAuth string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotBody))
+		_, _ = io.WriteString(w, `{"model":"jev-style-0.8b-decision-v3","answers":{"s00":`+
+			`{"type":"choice","choice":"l7_flood","confidence":0.83,"probabilities":{"l7_flood":0.83,"scraper":0.17}}},`+
+			`"usage":{"input_tokens":250,"output_tokens":0}}`)
+	}))
+	defer srv.Close()
+
+	c := NewSystemOne(Options{BaseURL: srv.URL + "/"})
+	assert.Equal(t, SystemOneName, c.Name())
+
+	verdicts, err := c.Judge(context.Background(), []detect.Suspect{floodSuspect()})
+	require.NoError(t, err)
+	assert.Empty(t, gotAuth)
+	assert.NotContains(t, gotBody, "model")
+	require.Len(t, verdicts, 1)
+	assert.Equal(t, SystemOneName, verdicts[0].Judge)
+	assert.Equal(t, "jev-style-0.8b-decision-v3", verdicts[0].Model)
+	assert.Equal(t, judge.LabelL7Flood, verdicts[0].Label)
+	assert.Equal(t, int64(250), c.InputTokens())
+
+	keyed := NewSystemOne(Options{BaseURL: srv.URL, APIKey: "k", Model: "m"})
+	_, err = keyed.Judge(context.Background(), []detect.Suspect{floodSuspect()})
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer k", gotAuth)
+	assert.Equal(t, "m", gotBody["model"])
+
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "nope", http.StatusUnauthorized)
+	}))
+	defer failing.Close()
+	_, err = NewSystemOne(Options{BaseURL: failing.URL}).Judge(context.Background(), []detect.Suspect{floodSuspect()})
+	require.Error(t, err)
+	assert.True(t, strings.HasPrefix(err.Error(), "systemone: unexpected status 401"), err.Error())
+}

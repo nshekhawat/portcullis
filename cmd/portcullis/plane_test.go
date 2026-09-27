@@ -72,6 +72,60 @@ func TestBuildFallbackJudge_EmptyIsNotAnError(t *testing.T) {
 	assert.Nil(t, j)
 }
 
+// TestBuildJudge_OpenAIWithoutAuth checks that a local server needs no key: an
+// empty api_key_env builds the judge.
+func TestBuildJudge_OpenAIWithoutAuth(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Judgment.Judge = config.JudgeOpenAI
+	cfg.Judgment.OpenAI.Model = "local-model"
+
+	j, err := buildJudge(cfg, zap.NewNop())
+	require.NoError(t, err)
+	assert.Equal(t, "openai", j.Name())
+
+	cfg.Judgment.FallbackJudge = config.JudgeOpenAI
+	j, err = buildFallbackJudge(cfg, zap.NewNop())
+	require.NoError(t, err)
+	assert.Equal(t, "openai", j.Name())
+}
+
+// TestBuildJudge_OpenAINamedKeyMissingFailsStartup: once an operator names a
+// key variable, an unset variable is an error rather than a silent no-auth.
+func TestBuildJudge_OpenAINamedKeyMissingFailsStartup(t *testing.T) {
+	require.NoError(t, os.Unsetenv("PORTCULLIS_TEST_MISSING_OPENAI_KEY"))
+
+	cfg := config.DefaultConfig()
+	cfg.Judgment.Judge = config.JudgeOpenAI
+	cfg.Judgment.OpenAI.Model = "local-model"
+	cfg.Judgment.OpenAI.APIKeyEnv = "PORTCULLIS_TEST_MISSING_OPENAI_KEY"
+
+	_, err := buildJudge(cfg, zap.NewNop())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "PORTCULLIS_TEST_MISSING_OPENAI_KEY")
+}
+
+// TestBuildJudge_SystemOne checks the provider-agnostic System One judge:
+// no auth by default, and a named but unset key fails startup.
+func TestBuildJudge_SystemOne(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Judgment.Judge = config.JudgeSystemOne
+
+	j, err := buildJudge(cfg, zap.NewNop())
+	require.NoError(t, err)
+	assert.Equal(t, "systemone", j.Name())
+
+	cfg.Judgment.FallbackJudge = config.JudgeSystemOne
+	j, err = buildFallbackJudge(cfg, zap.NewNop())
+	require.NoError(t, err)
+	assert.Equal(t, "systemone", j.Name())
+
+	require.NoError(t, os.Unsetenv("PORTCULLIS_TEST_MISSING_SYSTEMONE_KEY"))
+	cfg.Judgment.SystemOne.APIKeyEnv = "PORTCULLIS_TEST_MISSING_SYSTEMONE_KEY"
+	_, err = buildJudge(cfg, zap.NewNop())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "PORTCULLIS_TEST_MISSING_SYSTEMONE_KEY")
+}
+
 // TestBuildGuardrails_MalformedCIDRFailsStartup is the regression for L4: a
 // guardrails.allowlist entry that looks like a CIDR but does not parse (a
 // typo, such as a /33 or an out-of-range octet) used to be silently
