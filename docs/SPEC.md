@@ -128,7 +128,7 @@ The targets below are the latest tags observed on 2026-09-20. First run `go get 
 | github.com/testcontainers/testcontainers-go (+ modules/redis) | v0.40.0 | v0.44.0 |
 | go.uber.org/zap | v1.27.1 | v1.28.0 |
 | google.golang.org/protobuf | v1.36.10 | v1.36.12 (regenerate `*.pb.go` with matching protoc-gen-go) |
-| golangci-lint | v2.6.2 | v2.13.2 |
+| golangci-lint | v2.13.2 | v2.15.0 |
 
 **New dependencies (allowed):** none are required. Use only the standard library for the TypeSafe client, reverse proxy, circuit breaker, and CLI (`flag`). Do not add cobra, resty, or gobreaker.
 

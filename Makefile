@@ -11,7 +11,7 @@ PROTO_FILES=$(shell find api/proto -name '*.proto')
 # Go build flags
 LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)"
 
-GOLANGCI_LINT_VERSION=v2.13.2
+GOLANGCI_LINT_VERSION=v2.15.0
 
 # Default target
 all: lint test build
