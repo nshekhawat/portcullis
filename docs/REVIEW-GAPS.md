@@ -15,7 +15,7 @@ fix was applied and the test watched pass. L6 is the one exception — see its
 entry — deliberately left unchanged rather than guessed at.
 
 Verified clean after all fixes: `go build ./...`, `go vet ./...`,
-`golangci-lint run --build-tags e2e,live ./...` (v2.13.2, the pinned version;
+`golangci-lint run --build-tags e2e,live ./...` (v2.15.0, the pinned version;
 0 issues), `go test -race -count=1 ./...` (including the Redis integration
 suite, run against Docker), `go test -race -tags e2e ./test/e2e/...`,
 `govulncheck ./...` ("No vulnerabilities found" against code and imports), and
