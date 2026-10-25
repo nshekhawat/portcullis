@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.3] - 2026-10-25
+
 ### Changed
 
 - Upgraded Go from 1.26.0 → 1.27.3.
@@ -308,7 +312,8 @@ The following come from the post-implementation review in
 - `TestAggregatePrefixes` was order-dependent and could observe a snapshot
   between an observation's two shard-locked writes (M7).
 
-[Unreleased]: https://github.com/nshekhawat/portcullis/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/nshekhawat/portcullis/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/nshekhawat/portcullis/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/nshekhawat/portcullis/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/nshekhawat/portcullis/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/nshekhawat/portcullis/compare/v0.0.1...v0.1.0
