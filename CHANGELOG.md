@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- Upgraded Go from 1.26.0 → 1.27.3.
+- Updated direct dependencies: `client_golang` 1.24.1→1.25.0, `go-redis/v9` 9.22.0→9.23.0, `grpc` 1.85.0-dev→1.86.0-dev.
+- Updated numerous transitive dependencies to latest minor/patch versions.
+- Dropped toolchain directive (satisfied by Go 1.27.3).
 
 ## [0.1.2] - 2026-09-27
 
